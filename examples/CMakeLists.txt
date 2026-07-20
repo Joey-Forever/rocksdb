@@ -28,6 +28,11 @@ add_executable(transaction_example
 target_link_libraries(transaction_example
   ${ROCKSDB_LIB})
 
+add_executable(tikv_transaction_demo
+  tikv_transaction_demo.cc)
+target_link_libraries(tikv_transaction_demo
+  ${ROCKSDB_LIB})
+
 add_executable(compaction_filter_example
   compaction_filter_example.cc)
 target_link_libraries(compaction_filter_example
