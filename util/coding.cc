@@ -21,6 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 #pragma warning(push)
 #pragma warning(disable : 4244)
 #endif
+// 使用Base128-Varint编码uint32_t，从低字节开始每读取一个7位组生成一个字节，字节最高位表示后续还有没有数据
 char* EncodeVarint32(char* dst, uint32_t v) {
   // Operate on characters as unsigneds
   unsigned char* ptr = reinterpret_cast<unsigned char*>(dst);

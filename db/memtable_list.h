@@ -236,10 +236,14 @@ class MemTableListVersion {
   bool MemtableLimitExceeded(size_t usage);
 
   // Immutable MemTables that have not yet been flushed.
+  // 待flush的immemtable列表，所有模式下都需要
   std::list<ReadOnlyMemTable*> memlist_;
 
   // MemTables that have already been flushed
   // (used during Transaction validation)
+  // 已经flushed的部分历史immemtable列表，不直接将这些immemtable从内存删除，主要用于transaction事务模式下，
+  // 提供给事务进行写冲突检测/减少冲突检测时的sst io。
+  // ！！！普通的原子批写模式下，不需要这个东西，避免占据block cache等必要组件的内存。
   std::list<ReadOnlyMemTable*> memlist_history_;
 
   // Maximum size of MemTables to keep in memory (including both flushed
@@ -544,6 +548,11 @@ class MemTableList {
   size_t current_memory_usage_;
 
   // Cached value of current_->MemoryAllocatedBytesExcludingLast().
+  // ！！！
+  // 这里计算memtable和immemtable的总占用内存时，拿去掉last one之后的size和limit去比较，因为：
+  // 1. 如果加上last one之后只是超限少量，就允许少量超限，获取limit空间的足量利用。如果这时候直接gc掉last one，
+  //    会导致limit空间利用不足。
+  // 2. 当去掉last one之后，仍然超限了，就说明超限已经比较多，这时候直接gc last one就没问题。
   std::atomic<size_t> current_memory_allocted_bytes_excluding_last_;
 
   // Cached value of current_->HasHistory().

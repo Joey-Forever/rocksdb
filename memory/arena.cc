@@ -26,6 +26,7 @@ size_t Arena::OptimizeBlockSize(size_t block_size) {
   block_size = std::min(Arena::kMaxBlockSize, block_size);
 
   // make sure block_size is the multiple of kAlignUnit
+  // 维持block_size是kAlignUnit的倍数，方便内部分配的时候进行对齐
   if (block_size % kAlignUnit != 0) {
     block_size = (1 + block_size / kAlignUnit) * kAlignUnit;
   }
@@ -105,6 +106,9 @@ char* Arena::AllocateFromHugePage(size_t bytes) {
   return addr;
 }
 
+// 按照固定kAlignUnit对齐分配bytes大小的内存区域，由于只是针对bytes大小进行
+// 内存分配，不会感知上层实际需要构造的类型，所以不会处理上层类型导致的over-aligned问题。
+// 从active block的低地址到高地址分配。
 char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
                              Logger* logger) {
   if (MemMapping::kHugePageSupported && hugetlb_size_ > 0 &&

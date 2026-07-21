@@ -1416,6 +1416,18 @@ struct DBOptions {
   // landed to the memtable.
   //
   // Default: false
+  // 在WriteGroup写完WAL之后，马上推进last sequence，随后让多个writer并行写writeBatch，谁写完直接返回，从而提高写并发。
+  // 1. 代价：普通原子批写情况下，会破坏snapshot read一致视图的不可变性以及WriteBatch的原子可见性。
+  // 2. 规避代价：使用TransactionDB的WritePrepared模式，本质上就是，把可见性判断在sequence number的
+  //            基础上增加了一个checkTxnStatus的约束，虽然我能看到，但是如果txnstatus不允许我看到，那我必须假装看不到。
+  //////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // JOEY_TODO: 因此Tikv场景下，不使用这种优化手段，而是在WriteGroup中，每个WritaBatch被赋值sequence区间之后，再将大的WriteBatch分为多个小batch，
+  //            空闲的writer帮助忙碌的writer完成剩余小batch，由于WriteBatch在分配了sequence之后，每个record的LSM内部顺序就已经确定好了，和进入memtable
+  //            的实际物理顺序无关。这样就可以保证快writer不会被慢writer阻塞过长时间，而且可以避免慢writer积累长尾延迟，并且避免unordered write的原子性、一致性破坏。
+  // ！！！！
+  // 其实这本质上是应用场景的不同，unordered write更适用于“caller-owned execution”，比如每个client向RocksDB开一个独立事务，所有事务就应该独立进展，最理想的就是谁结束就谁先
+  // 返回，而不是被其他事务阻塞或者占用自己事务的资源给其他事务干活，应该更隔离才合理。而在Tikv场景下，Rocksdb是作为Tikv系统的一个内部state machine，属于“system-owned execution”，这时候Tikv更关心的
+  // 是让所有region整体能够尽快的apply结束，让系统整体尾延迟更小，所以这时候其他空闲writer帮助忙碌writer就合理了，因为都是为了系统整体，而不是仅仅为了writer自身。
   bool unordered_write = false;
 
   // If true, allow multi-writers to update mem tables in parallel.
@@ -2552,6 +2564,15 @@ struct WriteOptions {
   // option will be ignored.
   //
   // Default: false
+  // 调用者调用DBImpl::Write将一个构造好的WriteBatch直接写入数据库，可以设置WriteOptions的memtable_insert_hint_per_batch
+  // 为true，用于concurrent memtable write时的WriteBatch级别hint优化。
+  // ！！！需要注意的是，在串行Memtable write情况下，这个会被ignore，而是使用更高效的Memtable级别的prefix hint，
+  //      Memtbale prefix hint粒度更细也更持久。而这个WriteBatch hint最大的优点就是，通过低成本满足了局部性较好的大WriteBatch的
+  //      hint需求，所以有以下缺点：
+  //      1）粒度粗导致局部性更差。而且当前的WriteBatch结束之后就会失效，无法做到跨WriteBatch积累局部性。
+  //      2）WriteBatch hint有效的前提是WritBatch本身整体具有较好的局部性。
+  //      2）WriteBatch太小时，固定的hint map维护以及splice检测成本难以摊薄。
+  //      3）其他writer并发写入的时候会使已有的hint被污染，从而削弱效果。
   bool memtable_insert_hint_per_batch = false;
 
   // For writes associated with this option, charge the internal rate

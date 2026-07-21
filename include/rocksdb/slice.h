@@ -30,6 +30,11 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Slice：一种read-only的二进制数据容器，主体是const char*
+/////////////////////////////////////////////////////////////////////////////////////
+// RocksDB内部统一使用Slice来理解所有key、所有value，不管kv原始在业务层是什么类型，其实都是
+// 一段内存数据（字节数组），Slice直接将这段数据以字符串的方式理解（这里的字符串只是一个二进制容器），然后
+// RocksDB就方便对key进行按逐字节compare了。
 class Slice {
  public:
   // Create an empty slice.
@@ -133,6 +138,10 @@ class Slice {
 // A likely more efficient alternative to std::optional<Slice>. For example,
 // an empty key might be distinct from "not specified" (and Slice* as an
 // optional is more troublesome to deal with).
+// 在区间表示中，区间上下界start_key和end_key如果使用Slice来表示，很难表示“无下届/无上届”的情况，
+// 因为Slice()表示的还是有届，只不过这个届的key是“”空串，而OptSlice相当于对Slice进行了一层封装，
+// OptSlice()表示的就是无届的情况。
+// 该类型可以替代std::optional使用，而且没有bool值以及内存对齐这些额外的内存开销。
 class OptSlice {
  public:
   OptSlice() : slice_(nullptr, SIZE_MAX) {}
@@ -162,6 +171,9 @@ class OptSlice {
   //   Slice start, limit;
   //   RangeOpt rng = {&start, &limit};
   //   start = ...;  // BUG: would not affect rng
+  // 由于OptSlice会持有一个Slice值，而不是引用/指针，所以OptSlice不提供隐式的OptSlice(const Slice* ptr)构造，
+  // 而是提供CopyFromPtr这种方式，让调用者明确知道，通过ptr方式创建的OptSlice会复制一个新的Slice值，而不是指向
+  // 传入的ptr。
   static OptSlice CopyFromPtr(const Slice* ptr) {
     return ptr ? OptSlice{*ptr} : OptSlice{};
   }

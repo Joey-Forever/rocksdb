@@ -195,6 +195,13 @@ struct DBOpenLogRecordReadReporter : public log::Reader::Reporter {
 //
 // Since it's a very large class, the definition of the functions is
 // divided in several db_impl_*.cc files, besides db_impl.cc.
+// JOEY_TODO: 支持在memtable flush之后修改MANIFEST使sst生效的时候，将raft log flush index
+//            一起原子化的持久化到MANIFEST中，以支持在rocksdb wal关闭的情况下，不会出现tikv v2
+//            那样的memtable已经成功flush但是raft log flush index未来得及执行回调进行持久化从而导致
+//            崩溃恢复时raft log重复apply的情况。
+//            tikv v1在apply时通过将 default/write/lock CF 的实际数据修改和raft CF 中的 RaftApplyState一起进入
+//            同一个WriteBatch，并且整个WriteBatch作为一个完整的logical record写入WAL，借助WriteBatch的跨CF原子性
+//            避免了数据修改持久化了（到WAL）但是apply index没持久化的问题。本质上也是对一种原子性特性的依赖。
 class DBImpl : public DB {
  public:
   DBImpl(const DBOptions& options, const std::string& dbname,
@@ -745,6 +752,8 @@ class DBImpl : public DB {
                                       bool allow_refresh = true);
 
   virtual SequenceNumber GetLastPublishedSequence() const {
+    // 非two write queues的默认模式下，last_seq_same_as_publish_seq_为true，也就是sequence number的
+    // publish可见性直接由last_sequence_承担。
     if (last_seq_same_as_publish_seq_) {
       return versions_->LastSequence();
     } else {
@@ -1467,6 +1476,7 @@ class DBImpl : public DB {
   // set, the seq is not increased at all.
   //
   // Default: false
+  // 只有以transaction事务方式打开DB时这个值才可能为true，普通的原子批写打开DB时始终为false
   const bool seq_per_batch_;
   // This determines during recovery whether we expect one writebatch per
   // recovered transaction, or potentially multiple writebatches per

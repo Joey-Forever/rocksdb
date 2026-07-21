@@ -163,6 +163,7 @@ extern const double kIncSlowdownRatio;
 // ColumnFamilyHandleImpl is the class that clients use to access different
 // column families. It has non-trivial destructor, which gets called when client
 // is done using the column family
+// tikv场景下，DB::Open获取的DBImpl实例，每个CF的ColumnFamilyHandle的实际动态类型就是ColumnFamilyHandleImpl
 class ColumnFamilyHandleImpl : public ColumnFamilyHandle {
  public:
   // create while holding the mutex
@@ -676,7 +677,9 @@ class ColumnFamilyData {
 
   WriteBufferManager* write_buffer_manager_;
 
+  // active memtable
   MemTable* mem_;
+  // read-only/immutable memtable
   MemTableList imm_;
   SuperVersion* super_version_;
 

@@ -348,6 +348,10 @@ struct AdvancedColumnFamilyOptions {
   //   * existing_value for that key is a put i.e. kTypeValue
   // If inplace_callback function is set, check doc for inplace_callback.
   // Default: false.
+  // 支持对active memtable中已存在的key进行原地更新，而sequence number会复用旧的，所以
+  // 会破坏snapshot read的不变性语义。而且也不兼容多writer并行Write memtable。所以一般不使用
+  // 需要使用到这个东西的场景无非就是同一个WriteBatch内存在对同一个key的多次修改，这种情况下推荐是
+  // 直接在上层进行合并后再写入RocksDB，避免不必要的snapshot一致性破坏。
   bool inplace_update_support = false;
 
   // Number of locks used for inplace update
@@ -787,6 +791,14 @@ struct AdvancedColumnFamilyOptions {
   // Default: 0 (disabled)
   //
   // Dynamically changeable through SetOptions() API
+  // 该值表示，当某个key的连续merge op chain达到多大的时候，需要在写路径上同步执行Full Merge操作，而Full Merge本质上是一次Read-Modify-Write，所以其实就是拿写性能换取读性能/compaction性能，
+  // 避免chain过长导致读放大严重/compaction merge cpu耗时。
+  // 1. 当该值不为0的时候，WriteGroup的所有写操作必须串行，从而避免并发RMW引起的经典写冲突。这涉及一个责任边界的问题：
+  //    1） 当上层调用的是Get->上层Modify->Put的时候，对于RocksDB来说，他只需要保证Put操作本身原子写入，RMW的写冲突检测需要上层保证，RocksDB不需要负责。
+  //    2） 但是当RocksDB内部触发了Full Merge这类内部RMW，RocksDB就必须内部检测/避免RMW写冲突，避免数据丢失，所以RocksDB采取的方式就是直接禁止Writer并发WriteBatch memtable，优先保数据安全。
+  // 2. 如果配置支持unordered_write的话，这个值必须为0，因为unordered_write意味着同一个WriteGroup的多个writer必然可以并发执行writeBatch to memtable，与第一点冲突。
+  // 3. 当该值不为0，但是写路径上的Full Merge需要以付出sst io为代价的时候，需要结合strict_max_successive_merges是否为true进一步判断。当strict_max_successive_merges为false时，
+  //    写路径上需要进行sst io的Full Merge会被abort，优先保住写路径性能。
   size_t max_successive_merges = 0;
 
   // Whether to allow filesystem reads to stay under the `max_successive_merges`

@@ -399,6 +399,21 @@ FlushReason MemTable::GetFlushReason() const {
   return FlushReason::kWriteBufferFull;
 }
 
+// 1. 功能：
+//    该方法用于检测当前memtable是否需要full flush了，是则然后cas标记FLUSH_REQUESTED。
+// 2. 必要性：
+//    1）内存：控制memtable占用内存空间，减小对block cache这些组件的内存压力
+//    2）flush耗时：memtable积累太大会导致单次flush耗时增加，增加immemtable累积压力，提高write stall风险
+//    3）读性能：memtable太大会导致已经进入cpu cache的节点被淘汰的概率增加，叠加跳表的随机跳跃访问会导致cache locality变差，影响读取性能
+//    4）WAL截断：及时flush成sst，可以减小memtable对老WAL的依赖，让WAL及时截断，减少崩溃恢复的replay耗时
+//    5）不能太小：但是也不能太小，不然会导致频繁flush和L0 compaction增加固定开销、Arena分配粒度错配导致内存利用效率低下、
+//               L0文件过多导致L0读放大和write stall、flush时合并旧版本的优化受阻导致compaction写放大。
+// 3. 软阈值：
+//    该方法采用的是软阈值，也就是允许短时超限，主要是为了不给正在write的WriteGroup增加额外的并发控制复杂度。
+//    leader生成write group的时候会约束总大小避免memtable overshoot过大，但是这要求上层控制单个WriteBatch大小。
+// 4. 调用时机：
+//  1）WriteGroup串行write memtable时，每当memtable Add时就会调用该方法
+//  2）WriteGroup并行write memtable时，当每个write完成自己的WriteBatch之后，就会调用该方法 
 void MemTable::UpdateFlushState() {
   auto state = flush_state_.load(std::memory_order_relaxed);
   if (state == FLUSH_NOT_REQUESTED && ShouldFlushNow()) {
@@ -1137,6 +1152,7 @@ void MemTable::UpdateEntryChecksum(const ProtectionInfoKVOS64* kv_prot_info,
   }
 }
 
+// JOEY_TODO: 看到这里
 Status MemTable::Add(SequenceNumber s, ValueType type,
                      const Slice& key, /* user key */
                      const Slice& value,

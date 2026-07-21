@@ -162,6 +162,7 @@ class DB {
   // if the DB is already open (read-write) by another DB object. (This
   // guarantee depends on options.env->LockFile(), which might not provide
   // this guarantee in a custom Env implementation.)
+  // 以read-write形式打开db，并且只打开default cf，如果db中还有其他cf，将会open失败。
   static Status Open(const Options& options, const std::string& name,
                      std::unique_ptr<DB>* dbptr);
 
@@ -179,6 +180,8 @@ class DB {
   // will use to operate on column family column_family[i].
   // Before destroying the DB, you have to close all column families by calling
   // DestroyColumnFamilyHandle() with all the handles.
+  // 以read-write形式打开db，column_families必须包含该db的所有cf，提供该入参是为了让调用者
+  // 可以决定每个打开cf各自的运行时配置。
   static Status Open(const DBOptions& db_options, const std::string& name,
                      const std::vector<ColumnFamilyDescriptor>& column_families,
                      std::vector<ColumnFamilyHandle*>* handles,
@@ -202,6 +205,7 @@ class DB {
   // WAL file exists. Empty WAL files can be left behind by features such as
   // async WAL precreation and are tolerated.
   //
+  // 以read-only形式打开db，而且只打开default cf
   static Status OpenForReadOnly(const Options& options, const std::string& name,
                                 std::unique_ptr<DB>* dbptr,
                                 bool error_if_wal_file_exists = false);
@@ -217,6 +221,7 @@ class DB {
   // WAL file exists. Empty WAL files can be left behind by features such as
   // async WAL precreation and are tolerated.
   //
+  // 以read-only形式打开db，column_families可以是完整cf的一个子集，但是必须包括default cf
   static Status OpenForReadOnly(
       const DBOptions& db_options, const std::string& name,
       const std::vector<ColumnFamilyDescriptor>& column_families,
@@ -482,6 +487,9 @@ class DB {
   // and value must remain valid until this method returns.
   //
   // Returns OK on success, and a non-OK status on error.
+  // 不同于Put方法是对key->value进行存储，PutEntity是将key->{列名1:列值1,...}这样的宽列实体进行存储，相当于RocksDB直接感知了value的列语义了。
+  // 对于Tidb这种本身就将value中的多列序列化成了opaque bytes再发送给tikv的使用场景，这种使用方式是无意义的，tikv只需要将value按照opaque bytes直接
+  // 调用Put存储进RocksDB更为合理，在架构和语义分层上也更为干净。
   virtual Status PutEntity(const WriteOptions& options,
                            ColumnFamilyHandle* column_family, const Slice& key,
                            const WideColumns& columns);
@@ -700,6 +708,8 @@ class DB {
   // Returns OK on success. Returns NotFound and an empty wide-column entity in
   // "*columns" if there is no entry for "key". Returns some other non-OK status
   // on error.
+  // 可以用来兼容Put方法插入的非宽列实体的key->opaque value，这时GetEntity出来的就是只有一个
+  // default列的Entity
   virtual Status GetEntity(const ReadOptions& /* options */,
                            ColumnFamilyHandle* /* column_family */,
                            const Slice& /* key */,
