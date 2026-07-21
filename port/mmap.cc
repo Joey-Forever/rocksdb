@@ -25,6 +25,7 @@ MemMapping::~MemMapping() {
   }
 #else   // OS_WIN -> !OS_WIN
   if (addr_ != nullptr) {
+    // 解映射mmap时记录的addr+len，如果mmap是huge page，而len没有对齐huge page，这里会失败。
     auto status = munmap(addr_, length_);
     assert(status == 0);
     if (status != 0) {
@@ -48,6 +49,12 @@ MemMapping& MemMapping::operator=(MemMapping&& other) noexcept {
   return *this;
 }
 
+// 具有具体实现的MemMapping实例的构造factory函数，mmap一块至少length大小的（私有匿名可读写）虚拟内存区域，
+// 会根据huge参数决定是否进行huge page mmap。
+// ！！！在进行huge为true的调用前，调用者务必先：
+//      1） 向系统预留足够的huge page
+//      2） 明确得知系统的默认huge page size
+//      3） 保证length是按照huge page对齐的，避免mmap成功但是后续munmap失败
 MemMapping MemMapping::AllocateAnonymous(size_t length, bool huge) {
   MemMapping mm;
   mm.length_ = length;
@@ -78,6 +85,10 @@ MemMapping MemMapping::AllocateAnonymous(size_t length, bool huge) {
     huge_flag = MAP_HUGETLB;
 #endif  // MAP_HUGE_TLB
   }
+  // ！！！
+  // 这里设置了MAP_HUGETLB的话，mmap会按照操作系统默认的大页size进行对齐分配。
+  // 所以使用huge page分配之前务必先向系统预留足够的大页并得知默认huge page size。
+  // 避免后续的munmap失败。
   mm.addr_ = mmap(nullptr, length, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | huge_flag, -1, 0);
   if (mm.addr_ == MAP_FAILED) {

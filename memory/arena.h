@@ -22,6 +22,188 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// 操作系统虚拟内存页表：
+//  1. 页表本质上是一个Radix Tree，用于将虚拟地址空间内存页映射到物理内存页，CPU进行虚拟地址转换时需要直接读取。
+//  2. 使用Radix Tree好处：
+//    1）结构简单，不需要像其他数据结构一样为了性能需要进行复杂的结构调整，适合硬件进行优化。
+//    2）搜索算法简单高效，虚拟地址本身可以拆为固定数目分量负责页表的各级索引，因此搜索路径固定且非常短，
+//       而且每级索引可以直接使用对应分量值进行数组下标索引，不需要key compare。
+//  3. 使用Radix Tree唯一缺点就是页表节点固定大小会导致内存浪费。优化方式：
+//    1）页表只对真正需要分配物理内存的虚拟内存页建立下级页表节点。
+//    2）进程虚拟地址的申请和分配基本都有一定连续性，不会完全随机，连续的虚拟页可以共享高层页表节点和末级节点，因此
+//       应用场景的work load本身决定了页表各级节点的内存浪费不会过于严重。
+//    3）TLB可以对"虚拟页号->物理页号"的地址转换结果进行缓存，避免每次转换都搜索多级页表。
+//    4）2MB和1GB的huge page大页申请机制，让用户态能够申请大块连续虚拟地址空间，让多级页表搜索不需要总到
+//       末级节点也可确定物理页，避免频繁零散申请4KB page导致的多级页表节点内存浪费，更重要的是可以减少相同
+//       大小虚拟内存区域所需要的TLB entry数目，大幅提高TLB cache hit的概率。
+//  4. VMA（Virtual Memory Area）是用于描述一段已分配虚拟地址空间的具体语义的结构，例如读写权限、内存映射关系、大页机制等。
+//     是操作系统对已分配虚拟内存空间进行管理的核心结构。他通过page fault缺页异常和页表进行联系起来。
+//     1）运行时上层申请虚拟地址空间主要有brk和mmap两种方式（主线程自动扩栈例外），brk是只能对堆末端VMA进行边界扩展/缩小，拓展的部分的语义和原堆VMA一致。
+//        而mmap则更灵活，可以自由创建一个具有独立语义的VMA，也支持对某个VMA区域进行独立munmap删除解物理映射，比如线程库会为每个线程
+//        单独mmap创建线程栈、Arena通过mmap创建huge page映射等。
+//     2）上层申请一块虚拟内存返回成功后，该虚拟内存的区间范围和具体语义会记录在某个VMA中，但是不会立刻分配物理内存。
+//     3）当CPU想要访问某个虚拟地址时，首先去访问TLB或者页表，如果发现页表中不存在该“虚拟页->物理页”的映射关系的时候，会触发page fault缺页异常。
+//     4）随后内核去找该虚拟地址是否存在VMA，如果不存在则抛出SIGSEGV。如果存在，则根据VMA的具体语义，分配空闲物理页或到page cache中获取
+// 　　   共享物理页后再到页表中建立“虚拟页->物理页”映射关系。
+//     5）后续CPU再访问相关虚拟地址时就可以从TLB/页表中获得虚拟页到物理页的映射了。
+//     6）主线程栈也是一个VMA，他和pthread线程栈mmap VMA都是在线程创建的时候就分配到一块VMA区域，cpu寄存器记录线程的栈指针，在进入一个新函数时
+//        只需要移动栈指针预留出栈帧空间，栈局部变量的内存分配也不需要动态内存分配的用户态内存分配器管理以及可能的brk和mmap系统调用，局部变量只有在
+//        读写时根据栈帧内固定偏移进行栈内存的访问。不同的是在实际访问栈内存虚拟地址时，对于pthread线程来说，VMA不可自动扩展，超出VMA时直接爆栈；主线程的
+//        VMA可以自动扩展，当内核处理cpu page fault时如果发现地址越界没有落在任何一个VMA内，但是处于主线程VMA地址下方且满足扩栈条件时，就会触发主线程VMA的扩展。
+//     7）所有的VMA中，只有主线程栈VMA具有越界访问时自动扩展的能力，普通mmap和传统栈都不行，传统栈只能通过brk主动扩展。
+//  5. 现代内存分配器常见的“purge/release”机制，会利用虚拟内存机制对虚拟内存和物理内存进行分开释放管理：
+//     1）对某个mmap出来的大块虚拟内存区域，如果整块区域都空闲了，可以直接munmap同时删除VMA区域，删除页表映射和释放物理内存页，
+//        但是后续上层需要再次分配虚拟内存时可能需要重新mmap系统调用建立VMA。
+//     2）更多时候是，该大块区域只有某些虚拟页空闲了，其他页还在使用，这时候可以使用madvise只是将free page的页表映射和物理页
+//        释放，但是仍然保留该free page的VMA以及存在于内存分配器的free list中，后续再次分配虚拟内存给上层使用时，不需要重新
+//        mmap，可以直接将free page分配出去，上层使用时再触发page fault重新分配清零物理页并建立页表映射。madvice会为此提供两种
+//        策略：MADV_FREE，只是告诉内核该虚拟内存区域的物理内存页在内存紧张时可以回收但是允许短时间内保留，适合短时间就能复用的场景，
+//        减少缺页成本；MADV_DONTNEED，告诉内核马上将物理内存页释放并取消页表映射，适合长时间空闲页面和需要积极降低物理内存（RSS）的场景。
+//     3）但是如果某个虚拟页中有大量空闲区域，只有少量正在使用的区域，内存分配器不会为了整理碎片而移动存活对象，因为这会改变对象的地址，而上层
+//        访问时是直接是使用保存的虚拟地址的，这会导致垂悬指针问题。内存分配器只能合并相邻空闲块为大空闲块。
+//  6. 进程VMA索引结构不使用Radix Tree：
+//     VMA本身作为进程虚拟地址空间分配区域的语义管理结构，他在虚拟地址空间中也具有聚簇性和簇内连续性，但是他并不是多区间稀疏数组，因为
+//     每个VMA的key并不是单一的页偏移值，而是一个区间，比如多个VMA连续分布，VMA_1[100, 1000), VMA_2[1001, 2000)，如果将这两个
+//     VMA区间的左右边界插入朴素Radix Tree中，那Radix Tree视角下的key在末级节点中就会表现为极度稀疏分布，空间极大浪费。因此，VMA索引
+//     结构还是需要使用基于key compare的数据结构了，例如平衡树（查找性能稳定和子树不可逆聚合值增强，btree（TLB/CPU cache line缓存局部
+//     性和矮树高）、rbtree（稳定迭代器和intrusive无额外节点分配））、skiplist（高并发写和高效hint）。
+//  7. 进程虚拟地址空间基础布局：
+//     low_addr                                                                                                          high_addr
+//       |<---------------------------------------user space---------------------------------------------->|<----kernel space---->|
+//        指令区       静  态  存  储  区       堆区                内  存  映  射  区                主线程栈
+//     --|------|----------|-------|------|========>|----------------------------------------|<============|-----------------------
+//        .text   .rodata    .data   .bss    heap                     mmap                      main stack
+//     1） 虚拟地址空间的所有虚拟地址区间都通过VMA在Maple Tree上进行管理。
+//     2） 每个进程的虚拟地址空间都分为低地址的user space和高地址的kernel space，其中kernel space是所有进程共享的。
+//     3） .text、.rodata、.data、.bss这几个段是可执行程序装载之后被VMA映射到进程虚拟地址空间的，.text映射的是代码指令，.rodata映射的是只读的initiaized静态变量
+//         和无法被直接编译进指令的字面量，.data映射的是可写的非0 initialized静态变量，.bss映射的是可写的uninitialized静态变量和可写的0 initailized静态变量。
+//         还有一种常见情况时，即使静态变量有初始化值，但是该初始化值必须在运行时才能计算出来，那该值也会存在.bss等到运行时的初始化代码中才初始化。而使用constexpr修饰的静态变量
+//         必须能够在编译期确定const值。constexpr修饰的函数可以嵌套非constexpr函数，而如果一个变量的初始化值调用到该constexpr函数而且所有调用路径都是constexpr函数，
+//         就可以在编译期直接生成该变量初始化值，否则的话对于constexpr变量直接编译错误，对于非constexpr变量则等到运行时再计算。
+//     4） .text、.rodata直接PROT_READ只读映射page cache中的可执行文件对应页，而.data则通过PROT_WRITE｜PROT_READ｜MAP_PRIVATE读写私有映射page cache中
+//         可执行文件对应页，当需要写.data中的内容时，会触发COW重新映射到进程私有的anonymous page，修改不会被同步回可执行文件。
+//     5） 和前几个段不同的是，.bss段的实际对象内容不会存储到可执行文件中（因为全0），可执行文件只保留基础的.bss描述信息用于程序装载时进行映射。因此在访问.bss段地址处
+//         理page fault时，只需要映射共享只读0页或者直接映射私有的清零anonymous page，不再需要可执行文件在page cache中的内容。
+//  8. 进程页表格局：
+//         进程 A 的页表根                                进程 B 的页表根
+//      低地址表项 → A 的user_space页表              低地址表项 → B 的user_space页表
+//      高地址表项 ──────────┐         ┌─────────── 高地址表项
+//                         ↓         ↓
+//                   共享的kernel_space下级页表 ==> 非KPTI情况下，这个始终包含内核空间的完整映射，
+//                              ↓                 KPTI情况下，用户态时这里只映射少量内核入口代码
+//                          内核物理页面
+//      用户态 -> 内核态的切换逻辑：
+//      1） CPU在进程用户态执行过程中碰到"syscall/中断/异常"就会触发陷入内核态。
+//      2） CPU硬件层面完成内核态权限转换、执行指令地址转到内核入口代码等一整套受控操作。
+//      3） CPU已经处于内核态，开始执行内核入口代码，此时使用的页表和用户态时仍为同一个。
+//      4） KPTI情况下，执行内核入口代码时会将页表切换到具有完整内核映射的页表。
+//      5） 执行内核具体处理逻辑，此时使用的是当前已经具有完整内核映射的页表。
+//  9. 进程页表KPTI优化：
+//    1）必要性：传统的进程页表布局方式中，用户空间和内核空间的完整映射都在同一个页表中，共享内核映射的TLB entry也会开启global优化以
+//             实现多进程共享。但是这有个致命问题是，用户态和内核内存资源映射之间只有一层脆弱的权限保护，会被Meltdown漏洞突破。
+//    2）实现手段：用户态使用的用户页表只有少量的内核入口代码映射，真正进入内核态切换到内核页表后，才有完整的内核空间映射。禁用共享内核
+//               映射的global TLB entry优化（针对没有同时映射到两套页表的内核页面），避免用户态切回用户页表后仍能通过global TLB
+//               entry获取内核虚拟页映射。通过这两个手段实现了用户态和内核映射之间真正的物理隔离。
+//    3）PCID机制：KPTI的开启时，每次切换用户态内核态都要切换页表，即使前后两个页表的下级页表可能相同，“虚拟内存->物理内存，权限”的
+//               映射关系也相同，但是在CPU看来该进程切换了页表后会使旧页表的TLB cache全部失效。所以需要使用PCID机制为两个页表分别
+//               保留CPU TLB cache，切到内核页表时，用户页表TLB仍然保留不主动失效，降低切回用户态后的TLB miss。
+//    4）代价：KPTI+PCID机制下，内核态访问用户空间虚拟页时会导致TLB中存在两条重复（不同PCID）的TLB entry；KPTI会禁用共享内核映射的
+//           global TLB entry优化，这就导致了不同进程需要有独立的内核虚拟页映射TLB entry。两个因素叠加之下，加剧了TLB cache容量竞争。
+//  10. glibc malloc内存分配器原理：
+//    1） 堆chunk内部结构（std::max_align_t = 16）：
+//         |<------ chunk 1 (n * 16B)------->|<------ chunk 2 (m * 16B)------->|<------ chunk 3 (p * 16B)------->|
+//         ┌─────┬─────────┬─────────────────┬─────┬─────────┬─────────────────┬─────┬─────────┬─────────────────┐
+//         │prev │this_size│      user       │prev │this_size│      user       │prev │this_size│      user       │
+//     ... │size │ + flags │      space      │size │ + flags │      space      │size │ + flags │      space      │ ...
+//         └─────┴─────────┴─────────────────┴─────┴─────────┴─────────────────┴─────┴─────────┴─────────────────┘
+//           8B      8B      this_size - 16B    8B      8B      this_size - 16B    8B      8B      this_size - 16B
+//                         <----- true use 1 ------>         <----- true use 2 ------>         <----- true use 3 ------> 
+//       chunk_addr和chunk_size都需要按照16对齐，回收/复用结构管理chunk是按照原始chunk_size来管理，返回给上层用户的地址是
+//       “chunk_addr+16”，用户能够使用的为"当前chunk的user_space+下一个chunk的prev_size"，因此每个chunk固定浪费8B。
+//    2） 假设上层用户需要使用n字节：
+//          chunk_size = ceil_to_16_multi(n + 8)，需要分配size >= chunk_size的chunk
+//          space_wasted = chunk_size - n，下一个chunk的prev_size字段是算进当前chunk的user浪费的
+//       当实际分配的chunk大于所需的chunk_size时，需要进行切分，但是要保证切分后的new_chunk_size >= 32。
+//    3） chunk2空闲需要合并时如何找到chunk1和chunk3:
+//       找chunk1: chunk2的flags中的PREV_INUSE字段用于记录chunk1是否在使用，如果chunk1在使用，自然不需要和chunk1进行合并，
+//                也就不需要找了，如果chunk1空闲可合并，那么chunk2的prev_size字段会记录chunk1的size，此时可以直接前推出chunk1_addr。
+//       找chunk3: 堆top chunk保证至少MINSIZE的空闲，使得最后一个从top chunk分配出去的chunk可以正常访问下一个prev_size和PREV_INUSE
+//                flag。根据chunk2_size后推出chunk3_addr，如果chunk3是top chunk，chunk2直接和top合并，否则继续根据chunk3_size
+//                后推出下一个chunk（必然存在）访问其PREV_INUSE字段判断chunk3是否空闲可合并。
+//    4） 大块mmap（由动态MMAP_THRESHOLD阈值控制）的必要性：
+//　　　   top chunk达到阈值时，分配器会通过brk系统调用向系统释放虚拟内存和物理内存，但是如果一些空闲chunk由于碎片无法合并回top chunk，
+//        停留在空闲链表结构中的chunk，出于避免复用缺页原因，其物理内存不会被分配器自动madvice(MADV_DONTNEED)释放。大块分配的物理内存
+//        如果在空闲链表中滞留时间过长，会导致RSS在上层free后仍持续较高。而mmap chunk可以在free后直接munmap，不参与回收/复用管理。
+//    5） chunk回收/复用结构：
+//       +----------------------------------+
+//       | thread 1 / tcache                |
+//       | entries[64]: singly linked list  |
+//       | counts[64] : node count          |         +--------------------------------------+
+//       | thread_arena                     +----+    | arena mutex                          |
+//       +----------------------------------+    |    | fastbinsY[10]: singly linked list    |
+//                                               |    | bins[]: doubly linked list           |
+//       +----------------------------------+    +--->+   unsorted[1]: 1 bin / any size      |
+//       | thread 2 / tcache                |    |    |   small[2..63]: 62 bins / 32..1008B  |
+//       | entries[64]: singly linked list  |    |    |   large[64..126]: 63 bins / >=1024B  |
+//       | counts[64] : node count          |    |    | top -> [top chunk]                   |
+//       | thread_arena                     +----+    +--------------------------------------+
+//       +----------------------------------+
+//     -- tcache（单链表）：每个线程一个，存储该线程独有的较小的chunk，有限额，超过的需要回共享arena。标志其中chunk使用状态的
+//                        PREV_INUSE flag保持为1。
+//     -- fastbinsY（单链表）：存储极小的chunk，标志其中chunk使用状态的PREV_INUSE flag保持为1，意味着他们不参与合并，好处是
+//                           避免马上就复用时的合并/切分来回成本，代价是会导致其他chunk也无法合并加剧碎片问题（削弱unsortedbin的作用）。
+//                           由于不参与合并所以不需要双向链表用于取任意chunk。支持“插入-插入”和“插入-取出”头操作cas无锁并发，但是
+//                           “取出-取出”仍需要拿mutex串行。
+//     -- unsortedbin（双链表）：所有合并/切分后的（large）chunk都需要直接插到该bin的链表中转，因为后续如果马上又要合并/切分的话，
+//                             又会取出来修改chunk size，之前插入有序large bin的开销就浪费了。代价是需要付出中转成本，如果碎片
+//                             较多导致合并操作无法有效执行，可能导致unsorted链变长，导致插入有序large bin的成本集中转移到了后续的
+//                             的复用分配中。（例如，A->B->C->D四个chunk进行free，如果他们能够有效合并成一个，那么他们free时的
+//                             开销就只有“合并+unsortedbin链操作”的O(1)开销，后续复用分配时最多只需要执行一次有序bin插入，但是
+//                             如果四个chunk被碎片隔开无法合并，他们就会单独存在于unsortedbin中，后续复用分配时仍需要执行4次有序
+//                             bin插入，而且还付出了中转到unsortedbin到成本。）
+//     -- smallbins（双链表）：小尺寸chunk的有序bin结构，每个桶一个尺寸，没有桶内搜索成本。
+//     -- largebins（双链表）：大尺寸chunk的有序bin结构，每个桶负责一个尺寸区间，所以桶内的搜索成本较高。
+//     -- top chunk：管理从堆brk申请后的剩余可分配空间。空闲链表中的chunk物理内存只有在合并回到top chunk后才有机会被分配器按照阈值
+//                   自动归还给操作系统。
+//    6）malloc/free流程：
+//       malloc：tchache->fastbin->（小申请先查精确smallbin/大申请先整理合并fastbin）->尺寸归类unsortedbin至上限或遇到精确匹配chunk
+//               ->到有序bins搜索能够容纳申请size的chunk->top chunk->（小申请会整理合并fastbin后重试）->sysmalloc（brk扩展堆/mmap）
+//       free：tcache->fastbin->PREV_INUSE置0后合并前后chunk->回top/插入unsortedbin->（top chunk超阈值触发systrim收缩堆）
+//    7）多arena原理：
+//       -- 每个线程tcache会关联一个arena，每个arena有自己的heap，其中main arena的heap就是系统堆，而non-main arena的heap是通过mmap
+//          创建的。由于上层在线程A malloc的内存可能在线程B free，所以不可以根据tcache记录到的arena进行free。
+//       -- non-main arena的heap首地址按照heap_size进行对齐（先mmap 2*heap_size占位，再将返回地址向上对齐到heap_size倍数，随后将前后
+//          不需要的munmap），所以free一个chunk的时候，先根据flag字段判断是否属于main arena，如果是non-main arena，将chunk_addr向下对
+//          齐到heap_size的倍数，得到的就是对应heap的首地址。再通过heap头部结构获取arena对象等信息。
+//       -- 当non-main arena的heap用完之后，可以mmap新建一个独立heap，多个heap通过头部结构链接起来，并且指向同一个arena对象。heap收缩
+//          通过覆盖PROT_NONE mmap同时释放物理页和禁止读写。
+//    8）总结：glibc malloc内存分配器的设计方式高度依赖空闲chunk的合并（最理想的情况是直接能够合并回top），否则回收的chunk无法服务更大的
+//            请求。unsortedbin是为了避免反复合并后进出有序bin导致的开销。而tcache/fastbin本质上会阻碍合并的发生（削弱unsortedbin的作
+//            用），但是却可以避免回收/复用时的合并/拆分/访问空闲链表开销。而整个合并/切分/bin操作都是耦合共享结构的，所以也难以做到细粒度并
+//            发操作，虽然能够通过多arena实现以arena为粒度的并发，但是一个线程只能从关联到他tcache的arena分配内存，其他arena如果有空闲块
+//            无法被利用。
+
+// JOEY_TODO: 实现ART
+// 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
+// 当work load满足以下条件时，通过朴素Radix Tree即可获得一个内存开销合理、结构固定、读写简单稳定高效、且不需要为了性能而做复杂的结构调整操作的有序索引结构。
+//   1） key类型是固定长度且较短的整数（如uint32、uint64），保证搜索路径稳定且足够短。
+//   2） key分布整体上是一个多区间稀疏数组，且每一区间数组足够大且内部key连续（除了最低位分量外其他高位分量全部为公共前缀），保证tree的上层节点扇出足够小，使得末层节点数目足够少且空间利用率足够高。
+//   3） 只要求内存开销合理不浪费严重，不要求进一步极限压缩节省空间。
+//   4） 典型如虚拟内存页表、page cache XArray。
+// ART（Adaptive Radix Tree）：
+// 朴素Radix Tree依赖work load是多区间稀疏数组（大量key拥有高度公共前缀），以降低上层节点扇出率以及下层节点数量，从而来摊薄固定size大节点的内存开销，避免下层节点空间占用率过低。而ART通过以下方式避免了对work load的依赖。
+//   1） 引入多类型节点，对于低利用率的下层节点使用小size节点，直接避免固定size节点的空slot空间浪费。（高层节点的高扇出不会导致高层空间浪费，他只是导致下层节点过多，间接引发下层空间浪费）。
+//   2） 叶子压缩（Lazy Expansion），当某个前缀下只有一个键时，直接将这个唯一键后缀压缩到同一个节点中，避免扩展唯一键后缀导致大量空间浪费（即使使用最小size节点也会浪费）。
+//   3） 内部单slot占用节点路径压缩（Path Compression），如果某些key在结构上存在公共前缀，那可能会产生许多只有一个占用slot的内部节点，这些内部节点唯一占用slot的内容可以直接下压进唯一child节点的节点级prefix字段中
+//      （prefix字段是所有类型Node都有，包括Node256），从而进一步压缩整体内存开销。而在随机work load下，内部节点的扇出率本身比较高，这种单slot占用节点出现的概率就非常小了，路径压缩的优化空间就很小了。
+//   4） 前两个方法已经能够基本解决朴素Radix Tree在随机work load下的空间浪费，第三个方法更多是针对公共前缀较多的key分布做的进一步空间极限压缩。
+
+
+// Arena是一个针对memtable场景的一个支持std::max_align_t默认对齐（不处理over-aligned）的内存分配器，他的特点是生命周期和
+// memtable绑定，而且memtable是一个对元素只add不delete的数据结构，Arena分配给memtable的所有内存只会随着memtable的销毁整体释放，
+// 也就意味着Arena不需要处理小块的回收和复用问题，因此：
+//   1） 分配小块只需要在active block下一个分配位置直接取align后的目标addr，不需要为零散free的小块维护复杂的回收/复用结构。
+//   2） 返回给上层申请者的小块块头没有固定8字节的记录chunk size的开销。
 class Arena : public Allocator {
  public:
   // No copying allowed
@@ -32,7 +214,13 @@ class Arena : public Allocator {
   static constexpr size_t kMinBlockSize = 4096;
   static constexpr size_t kMaxBlockSize = 2u << 30;
 
+  // ！！！
+  // AllocateAligned是固定按照kAlignUnit来对齐每个内存分配区域首地址的，不会感知上层需要的类型精确Alignment，
+  // 所以如果上层能够确定自己需要的对齐小于这个数的话，可以直接AllocateAligned就可以使用，否则的话就会发生over-aligned，
+  // 必须要上层自己在Allocate超额空间（至少“align - 1 + raw_ptr size”）后手动对齐。（像语言和编译器层面的直接对类型本
+  // 身进行栈堆分配这种能够明确感知类型精确Alignment的才可以内置就解决了这种over-aligned）
   static constexpr unsigned kAlignUnit = alignof(std::max_align_t);
+  // 对齐值必须是2的幂次方，方便位运算
   static_assert((kAlignUnit & (kAlignUnit - 1)) == 0,
                 "Pointer size should be power of 2");
 
@@ -88,12 +276,18 @@ class Arena : public Allocator {
   static size_t OptimizeBlockSize(size_t block_size);
 
  private:
+  // Arena在自身实例中内嵌一个对齐的2kb初始block用于小Arena的使用。
+  // 只有在这个内嵌block用完后才会去堆上申请新block，避免小Arena频繁到堆上申请内存。
+  // 需要满足按照std::max_align_t对齐
   alignas(std::max_align_t) char inline_block_[kInlineSize];
   // Number of bytes allocated in one block
   const size_t kBlockSize;
   // Allocated memory blocks
+  // normal block通过new关键字（本质是malloc）分配，本身就保证了首地址至少按照std::max_align_t对齐了。
   std::deque<std::unique_ptr<char[]>> blocks_;
   // Huge page allocations
+  // huge block通过mmap系统调用直接映射分配，保证首地址是按照系统默认huge page size对齐了，也就是自然
+  // 按照std::max_align_t对齐了。
   std::deque<MemMapping> huge_blocks_;
   size_t irregular_block_num = 0;
 
@@ -102,11 +296,19 @@ class Arena : public Allocator {
   // allocate unaligned memory chucks from the other end. Otherwise the
   // memory waste for alignment will be higher if we allocate both types of
   // memory from one direction.
+  // 将AllocateAligned和不要求对齐的Allocate分别从active block的两个方向开始分配。
+  // 避免混合分配时导致AllocateAligned造成过多内存浪费。缺点是，如果某一边只有很少的
+  // 分配请求，可能额外提前占用4kb/huge page的物理内存。
   char* unaligned_alloc_ptr_ = nullptr;
   char* aligned_alloc_ptr_ = nullptr;
   // How many bytes left in currently active block?
   size_t alloc_bytes_remaining_ = 0;
 
+  // 当active block没有足够空间分配的时候，AllocateFallback会优先考虑向系统mmap申请
+  // huge page粒度的新active block。hugetlb_size_就是每次申请该类型active block时的size。
+  // 因此该值需要满足两个条件：
+  //  1） 必须大于等于kBlockSize
+  //  2） 必须是系统默认huge page size的整数倍（避免munmap失败）
   size_t hugetlb_size_ = 0;
 
   char* AllocateFromHugePage(size_t bytes);
@@ -119,19 +321,24 @@ class Arena : public Allocator {
   AllocTracker* tracker_;
 };
 
+// 分配一块没有任何对齐要求的bytes大小内存区域。
+// 从active block的高地址到低地址分配。
 inline char* Arena::Allocate(size_t bytes) {
   // The semantics of what to return are a bit messy if we allow
   // 0-byte allocations, so we disallow them here (we don't need
   // them for our internal use).
   assert(bytes > 0);
+  // 1. active block中有剩余空间，直接分配
   if (bytes <= alloc_bytes_remaining_) {
     unaligned_alloc_ptr_ -= bytes;
     alloc_bytes_remaining_ -= bytes;
     return unaligned_alloc_ptr_;
   }
+  // 2. active block空间不足，需要申请新active block再获取分配空间
   return AllocateFallback(bytes, false /* unaligned */);
 }
 
+// JOEY_TODO: 看到这里
 // Like std::destroy_at but a callable type
 template <typename T>
 struct Destroyer {

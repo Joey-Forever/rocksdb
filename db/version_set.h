@@ -330,6 +330,8 @@ class VersionStorageInfo {
   int num_levels() const { return num_levels_; }
 
   // REQUIRES: PrepareForVersionAppend has been called
+  // 该值的意思是非空层的数目，层号从0开始计数，但是如果该值中间有的层为空，其实也算进去了。
+  // 所以，准确来说，返回的值，指向的是层号最大的非空层的下一层层号
   int num_non_empty_levels() const {
     assert(finalized_);
     return num_non_empty_levels_;
@@ -1800,6 +1802,8 @@ class VersionSet {
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.
+  // write group在完成写入操作（包括WAL和memtable）后，推进的就是last_sequence_这个sequence number，
+  // 非two write queues的普通DBImpl默认模式下，这个值的推进同时承担着publish可见性，该值使得系统并发读写的线性一致性有了一个清晰的证明依据。
   std::atomic<uint64_t> last_sequence_;
   // The last sequence number of data committed to the descriptor (manifest
   // file).
@@ -1817,6 +1821,10 @@ class VersionSet {
   // last_sequence_ also indicates the last published seq.
   // We have last_sequence <= last_published_sequence_ <=
   // last_allocated_sequence_
+  // WRITE PREPARED事务模式下（two write queues为true），该值由第二写队列往WAL中写入commit marker之后推进，
+  // 表示的是读者可能可见的最新publish时间，但是读者不能单纯依赖该值判断一个kv记录是可见的，还要额外判断这个kv记录所属事务
+  // 是否已经commit。
+  // tikv场景下使用的只是普通的DBImpl，连TransactionDB都不是，更不可能用到该值了。
   std::atomic<uint64_t> last_published_sequence_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
 

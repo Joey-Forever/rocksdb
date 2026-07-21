@@ -16,6 +16,10 @@ namespace ROCKSDB_NAMESPACE {
 
 template <typename T, std::size_t Align = alignof(T)>
 struct aligned_storage {
+  // type类本质上是一个已对齐的空字节容器，创建type类实例时只是占位了一块对齐的内存区域，没有进行T类的实际构造。
+  // 但是提供的只是一块raw storage，没有对T对象进行可选构造、析构的生命周期管理（std::optional的功能）。
+  //  1. 对char数组进行alignas(Align)保证字节容器首地址按照alignof(T)对齐了
+  //  2. 将char数组封装到struct中，使得字节容器实际占据的内存大小为alignof(T)的整数倍
   struct type {
     alignas(Align) unsigned char data[sizeof(T)];
   };

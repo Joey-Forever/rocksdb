@@ -306,6 +306,7 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
 }
 }  // namespace
 
+// 只以默认CF打开read-only db，会尝试CompactedDBImpl优化
 Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
                            std::unique_ptr<DB>* dbptr,
                            bool /*error_if_wal_file_exists*/) {
@@ -325,6 +326,7 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
   std::vector<ColumnFamilyDescriptor> column_families;
+  // cf只包含一个默认cf
   column_families.emplace_back(kDefaultColumnFamilyName, cf_options);
   std::vector<ColumnFamilyHandle*> handles;
 

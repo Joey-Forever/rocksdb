@@ -70,6 +70,8 @@ Slice GetSliceUntil(Slice* slice, char delimiter);
 
 // Borrowed from
 // https://github.com/facebook/fbthrift/blob/449a5f77f9f9bae72c9eb5e78093247eef185c04/thrift/lib/cpp/util/VarintUtils-inl.h#L202-L208
+// 使用zigzag算法将int64_t转成小uint64_t，避免直接将int64_t强转成uint64_t执行Base128变长编码导致编码后字节数过大，
+// 比如-1的补码是0XFFFFFFFFFFFFFFFF，直接Varint编码需要10字节
 constexpr inline uint64_t i64ToZigzag(const int64_t l) {
   return (static_cast<uint64_t>(l) << 1) ^ static_cast<uint64_t>(l >> 63);
 }
@@ -106,6 +108,11 @@ const char* GetVarint32PtrFallback(const char* p, const char* limit,
 inline const char* GetVarint32Ptr(const char* p, const char* limit,
                                   uint32_t* value) {
   if (p < limit) {
+    // 这个是单字节Varint的快速解析路径，如果当前字节最高位已经是0，说明已经是Varint最终结果。
+
+    // 读出来的uint8_t直接隐式扩展为uint32_t，是为了避免后续位运算时执行整数提升规则开销，
+    // 而先转成unsigned char是为了避免如果普通char是有符号且原值是负数（最高位为1）的情况，扩展到32位时会发生“符号扩展”导致高位全变成1且解释为uint32_t而改变了原始字节的值，
+    // 先转成unsighed char后可以在执行32位扩展时直接使用“零扩展”，使得最终的uint32_t仍然保留原始字节的值。
     uint32_t result = *(lossless_cast<const unsigned char*>(p));
     if ((result & 128) == 0) {
       *value = result;
@@ -127,6 +134,9 @@ inline void PutFixed16(std::string* dst, uint16_t value) {
   }
 }
 
+// 定长编码序列化uint32_t，序列化结构默认采用小端存储整形变量，
+// 如果本机就是小端字节序，可以直接copy原4bytes内存数据，
+// 如果本机是大端字节序，需要从低字节到高字节逐字节读取后追加到序列化结构
 inline void PutFixed32(std::string* dst, uint32_t value) {
   if (port::kLittleEndian) {
     dst->append(const_cast<const char*>(reinterpret_cast<char*>(&value)),
@@ -138,6 +148,9 @@ inline void PutFixed32(std::string* dst, uint32_t value) {
   }
 }
 
+// 定长编码序列化uint64_t，序列化结构默认采用小端存储整形变量，
+// 如果本机就是小端字节序，可以直接copy原8bytes内存数据，
+// 如果本机是大端字节序，需要从低字节到高字节逐字节读取后追加到序列化结构
 inline void PutFixed64(std::string* dst, uint64_t value) {
   if (port::kLittleEndian) {
     dst->append(const_cast<const char*>(reinterpret_cast<char*>(&value)),
@@ -149,6 +162,8 @@ inline void PutFixed64(std::string* dst, uint64_t value) {
   }
 }
 
+// 变长编码序列化uint32_t，使用的是Base128-Varint编码，
+// 由于编码时已经是从低字节往高字节读取然后逐字节编码，所以不需要再关心本机的字节序。
 template <typename... Args>
 inline void PutVarint32(std::string* dst, Args... args) {
   static_assert((std::is_convertible_v<Args, uint32_t> && ...),
@@ -160,6 +175,7 @@ inline void PutVarint32(std::string* dst, Args... args) {
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 
+// 使用Base128-Varint编码uint64_t，从低字节开始每读取一个7位组生成一个字节，字节最高位表示后续还有没有数据
 inline char* EncodeVarint64(char* dst, uint64_t v) {
   static const unsigned int B = 128;
   unsigned char* ptr = lossless_cast<unsigned char*>(dst);
@@ -171,15 +187,20 @@ inline char* EncodeVarint64(char* dst, uint64_t v) {
   return lossless_cast<char*>(ptr);
 }
 
+// 变长编码序列化uint64_t，使用的是Base128-Varint编码，
+// 由于编码时已经是从低字节往高字节读取然后逐字节编码，所以不需要再关心本机的字节序。
 inline void PutVarint64(std::string* dst, uint64_t v) {
   char buf[kMaxVarint64Length];
   char* ptr = EncodeVarint64(buf, v);
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 
+// 变长编码序列化int64_t，使用的是zigzag + Base128-Varint编码，
+// 由于编码时已经是从低字节往高字节读取然后逐字节编码，所以不需要再关心本机的字节序。
 inline void PutVarsignedint64(std::string* dst, int64_t v) {
   char buf[kMaxVarint64Length];
   // Using Zigzag format to convert signed to unsigned
+  // 先使用zigzag算法将int64_t转换成小uint64_t
   char* ptr = EncodeVarint64(buf, i64ToZigzag(v));
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }

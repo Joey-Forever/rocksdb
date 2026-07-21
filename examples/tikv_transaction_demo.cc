@@ -101,6 +101,7 @@ Status RunDemo() {
   }
 
   std::unique_ptr<DB> db;
+  // Open之后其底层直接指向一个DBImpl实例，不需要使用RocksdDB自带的TransactionDB，也不需要使用过时的BlobDB（blob file通过参数控制开启）
   status = DB::Open(options, kDBPath, &db);
   if (!status.ok()) {
     return status;
@@ -130,6 +131,10 @@ Status RunDemo() {
   }
 
   {
+    // snapshot会hold住RocksDB内的最新published sequence number，本质上建立的是当前数据库的一个逻辑数据视图，
+    // 后续需要snapshot scan时需要依赖当前数据库。（和checkpoint不一样的是，checkpoint是一个独立存在的
+    // 物理视图，创建时需要对MANIFEST元数据文件拷贝以及对sst集合进行硬链接，更重要的是checkpoint中并不会包含更新数据
+    // 也不会影响当前数据库的compaction、GC，而当前数据库出现损坏或删除也不会影响checkpoint视图）
     SnapshotGuard snapshot(db.get());
     ReadOptions snapshot_read;
     snapshot_read.snapshot = snapshot.get();

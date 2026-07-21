@@ -90,6 +90,7 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  // 借用class DB基类的Put实现
   return DB::Put(o, column_family, key, val);
 }
 
@@ -217,9 +218,15 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
   recoverable_state_pre_release_callback_.reset(callback);
 }
 
+// 调用者可以通过该方法把事先构造好的WriteBatch直接写入数据库
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
   Status s;
+  // 由于WriteBatch可能是调用者自行构造并追加操作记录，所以可能还没有prot_info，
+  // 所以该方法需要以传入的write_options为准再次判断是否需要生成prot_info作为兜底。
   if (write_options.protection_bytes_per_key > 0) {
+    // ！！！
+    // 如果实际需要prot_info但是还没有，该方法会对WriteBatch的rep_进行反序列化遍历，额外增加Write操作耗时，
+    // 所以调用者最好保证WriteBatch在构造之初就确定好write_options.protection_bytes_per_key。
     s = WriteBatchInternal::UpdateProtectionInfo(
         my_batch, write_options.protection_bytes_per_key);
   }
@@ -1055,6 +1062,19 @@ Status DBImpl::WriteImpl(
     }
   }
 
+  // unordered_write: WriteGroup在写完WAL之后，先推进last sequence，然后再让各writer并行写各自的WriteBatch，
+  //                  每个writer结束自己的WriteBatch之后，可以马上返回，不再等待同WriteGroup其他writer，从而提高了
+  //                  写并发。代价是，snapshot read的“不可变快照”被破坏，同一个snapshot read可能前后会看到不一致的数据。
+  //                  WriteBatch的原子可见性被破坏，某个WriteBatch可能在写到一半时数据就被某个snapshot read看到了。但是
+  //                  writer自身的Read-Your-Own-Write会保留。
+  //                  ！！！但是通过TransactionDB的WritePrepared模式，可以恢复snaoshot不可变性和writeBatch原子可见性，
+  //                       大概是通过分为prepare+commit两阶段，数据写memtable时事务状态是prepare的，snapshot read虽然
+  //                       能够部分看到该写事务sequence number更小的部分修改，但是去查找这些修改对应事务的状态时，会发现未提交，所以
+  //                       即使可见也要假装不可见，即使后续该写事务提交了，那commit sequence也要大于snapshot read的sequence，
+  //                       或者说snapshot read的read view可见范围中就没包含该事务，所以该事务的修改就对于该snapshot read自始自终都可以一直保持隐藏，
+  //                       而在该写事务完成commit之后执行的snapshot read，他的sequence大于该写事务commit sequence，或者说
+  //                       他的read view可见范围包含了该事务，所以他自始至终都可以看到该写事务的所有修改。
+  //                       本质上就是，把可见性判断在sequence number的基础上增加了一个checkTxnStatus的约束，虽然我能看到，但是如果txnstatus不允许我看到，那我必须假装看不到。
   if (immutable_db_options_.unordered_write) {
     const size_t sub_batch_cnt = batch_cnt != 0
                                      ? batch_cnt
@@ -1083,12 +1103,15 @@ Status DBImpl::WriteImpl(
     return finish_write(status);
   }
 
+  // pipelined_write: 写分为“WAL阶段+memtable阶段”，WriteGroup N执行memtable阶段时，允许
+  //                  WriteGroup N+1并行执行WAL阶段。
   if (immutable_db_options_.enable_pipelined_write) {
     return finish_write(PipelinedWriteImpl(
         write_options, my_batch, trace_batch, callback, user_write_cb, wal_used,
         log_ref, disable_memtable, seq_used));
   }
 
+  // 以下是默认情况下的普通写路径
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, user_write_cb,
                         log_ref, disable_memtable, batch_cnt,
@@ -1096,10 +1119,18 @@ Status DBImpl::WriteImpl(
                         /*_ingest_wbwi=*/wbwi != nullptr, trace_batch);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
+  // writer线程自己先进入JoinBatchGroup方法，等待自己的writer被设置为指定state确认自己在write group中的身份后返回执行对应操作，
+  // 该方法可能会触发writer线程自身的阻塞操作，直到自己被赋予一个合法的write group成员身份
   write_thread_.JoinBatchGroup(&w);
+  // ！！！
+  // writer线程来到这里之后，已经确定了自己在write group中的身份了，下面针对不同state执行对应操作
+
+
+  // 1. writer线程自己作为二级唤醒者被唤醒，他需要负责将write group中的一批writer唤醒为STATE_PARALLEL_MEMTABLE_WRITER
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_CALLER) {
     write_thread_.SetMemWritersEachStride(&w);
   }
+  // 2. writer线程自己作为并行memtable writer被唤醒，write group的WAL已经被leader写入，writer线程自己需要并行写自己的writeBatch到memtable
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
     // we are a non-leader in a parallel group
 
@@ -3449,6 +3480,8 @@ size_t DBImpl::GetWalPreallocateBlockSize(uint64_t write_buffer_size) const {
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
+// 这些实现是class DB基类自己的virtual方法实现，也就是全局也只能有一个实现，只是物理上放在了db_impl_write.cc，
+// 和其他所有子类自己的override版本不冲突，子类的方法中可以显式的使用DB::Put来调用基类的该实现。
 Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
                const Slice& key, const Slice& value) {
   // Pre-allocate size of write batch conservatively.
@@ -3460,6 +3493,7 @@ Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  // 这里会调用到相应子类的Write实现
   return Write(opt, &batch);
 }
 
