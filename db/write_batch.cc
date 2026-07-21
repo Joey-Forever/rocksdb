@@ -7,6 +7,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
+// WriteBatch的rep_序列化内容本身并不包含checksum字段，WriteBacth作为一个完整的logical record
+// 写入WAL的时候会先生成一个CRC，或者WriteBatch分为多个物理segment分别生成CRC。通过CRC，
+// WAL保证WriteBatch作为一个整体被replay，有任意物理segment的CRC对不上就丢弃整个WriteBatch，而不会恢复出半个WriteBactch。
 // WriteBatch::rep_ :=
 //    sequence: fixed64
 //    count: fixed32
@@ -178,9 +181,14 @@ struct SavePoints {
   std::stack<SavePoint, autovector<SavePoint>> stack;
 };
 
+// 从RocksDB的视角，最终的key会被编码成：
+// “user_key || user_timestamp || (sequence_number + type，固定8字节)”
+// 其中user_timestamp可有可无，同个CF的user_timestamp size必须相同，tikv场景下没有使用该字段，user_timestamp size = 0
 WriteBatch::WriteBatch(size_t reserved_bytes, size_t max_bytes,
                        size_t protection_bytes_per_key, size_t default_cf_ts_sz)
+      // flag用于记录当前这个WriteBatch包含哪些操作，例如Put、Delete、Merge等
     : content_flags_(0),
+      // 当前WriteBactch序列化后rep_的最大byte size，0表示无限制
       max_bytes_(max_bytes),
       default_cf_ts_sz_(default_cf_ts_sz),
       rep_() {
@@ -188,11 +196,14 @@ WriteBatch::WriteBatch(size_t reserved_bytes, size_t max_bytes,
   // entry.
   assert(protection_bytes_per_key == 0 || protection_bytes_per_key == 8);
   if (protection_bytes_per_key != 0) {
+    // 为每个kv创建一个8字节的保护校验值，用于检测WriteBatch在内存传递过程中是否存在数据损坏，该值不会跟随kv进入序列化内容进行持久化
     prot_info_.reset(new WriteBatch::ProtectionInfo());
   }
+  // 给这个WriteBatch序列化缓冲区预留至少一个header大小的空间
   rep_.reserve((reserved_bytes > WriteBatchInternal::kHeader)
                    ? reserved_bytes
                    : WriteBatchInternal::kHeader);
+  // 序列化内容至少包括一个header（sequence_number + kv record count）
   rep_.resize(WriteBatchInternal::kHeader);
 }
 
@@ -374,6 +385,7 @@ bool WriteBatch::HasRollback() const {
   return (ComputeContentFlags() & ContentFlags::HAS_ROLLBACK) != 0;
 }
 
+// 反序列化读取input中的下一条record，读取之后，会主动将input往后推
 Status ReadRecordFromWriteBatch(Slice* input, char* tag,
                                 uint32_t* column_family, Slice* key,
                                 Slice* value, Slice* blob, Slice* xid,
@@ -387,6 +399,10 @@ Status ReadRecordFromWriteBatch(Slice* input, char* tag,
       if (!GetVarint32(input, column_family)) {
         return Status::Corruption("bad WriteBatch Put");
       }
+      // 获取完cf_id之后，这里不执行break，而是直接无条件执行下面的kTypeValue分支获取kv本体，直到碰到break为止
+      // 这里写FALLTHROUGH_INTENDED这个宏，是为了：
+      //   1. 告诉其他开发者这里是故意不break的，防止其他开发者误以为没break是bug
+      //   2. 消除编译器的警告
       FALLTHROUGH_INTENDED;
     case kTypeValue:
       if (!GetLengthPrefixedSlice(input, key) ||
@@ -514,6 +530,7 @@ Status ReadRecordFromWriteBatch(Slice* input, char* tag,
   return Status::OK();
 }
 
+// 反序列化遍历WriteBatch的所有record，然后逐个使用handler中对应方法进行处理
 Status WriteBatch::Iterate(Handler* handler) const {
   if (rep_.size() < WriteBatchInternal::kHeader) {
     return Status::Corruption("malformed WriteBatch (too small)");
@@ -523,6 +540,7 @@ Status WriteBatch::Iterate(Handler* handler) const {
                                      rep_.size());
 }
 
+// 反序列化遍历WriteBatch的rep_序列化内容中指定区间[begin，end)的所有Record，然后逐个使用handler中对应方法进行处理
 Status WriteBatchInternal::Iterate(const WriteBatch* wb,
                                    WriteBatch::Handler* handler, size_t begin,
                                    size_t end) {
@@ -530,10 +548,14 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
     return Status::Corruption("Invalid start/end bounds for Iterate");
   }
   assert(begin <= end);
+  // ！！！
+  // 从WriteBatch的rep_序列化内容本体上获取（const指针指向，不会copy）目标段的read-only Slice，用于反序列化遍历，
+  // 因此整个过程中序列化内容本体一直在rep_上不会被修改和copy。
   Slice input(wb->rep_.data() + begin, static_cast<size_t>(end - begin));
   bool whole_batch =
       (begin == WriteBatchInternal::kHeader) && (end == wb->rep_.size());
 
+  // 这些Slice都只是通过const指针指向WriteBatch中的rep_序列化内容本体，而不是copy一份
   Slice key, value, blob, xid;
   uint64_t write_unix_time = 0;
 
@@ -542,6 +564,7 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
   // batches. We do that by checking whether the accumulated batch is empty
   // before seeing the next Noop.
   bool empty_batch = true;
+  // 只对实际进行数据库kv写操作的record进行found++计数，也只有这种record才会增加WriteBatch header中的count
   uint32_t found = 0;
   Status s;
   char tag = 0;
@@ -551,10 +574,12 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
   while (((s.ok() && !input.empty()) || UNLIKELY(s.IsTryAgain()))) {
     handler_continue = handler->Continue();
     if (!handler_continue) {
+      // handler主动不continue了，直接跳出循环遍历
       break;
     }
 
     if (LIKELY(!s.IsTryAgain())) {
+      // 上次handler处理后正常返回了ok，继续获取新的record进行处理
       last_was_try_again = false;
       s = ReadRecordFromWriteBatch(&input, &tag, &column_family, &key, &value,
                                    &blob, &xid, &write_unix_time);
@@ -562,7 +587,9 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
         return s;
       }
     } else {
+      // 如果上次handler处理后返回的时候try again，此次不再解析新record，而是继续使用上次的record进行重试
       assert(s.IsTryAgain());
+      // 如果handler连续两次发生try again，认为是bug
       assert(!last_was_try_again);  // to detect infinite loop bugs
       if (UNLIKELY(last_was_try_again)) {
         return Status::Corruption(
@@ -573,6 +600,8 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
       s = Status::OK();
     }
 
+    // ！！！
+    // 通过record的type tag判断应该调用handler的哪个方法进行处理
     switch (tag) {
       case kTypeColumnFamilyValue:
       case kTypeValue:
@@ -763,6 +792,7 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
   if (!s.ok()) {
     return s;
   }
+  // 如果handler没有主动不continue，且需求是遍历所有record，但是found record和WriteBatch header count不一致，说明WriteBatch损坏
   if (handler_continue && whole_batch &&
       found != WriteBatchInternal::Count(wb)) {
     return Status::Corruption("WriteBatch has wrong count");
@@ -855,6 +885,7 @@ Status CheckColumnFamilyTimestampSize(ColumnFamilyHandle* column_family,
 }
 }  // anonymous namespace
 
+// 该方法会将一个kv（包含put type enum）序列化到WriteBatch的rep_中
 Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
                                const Slice& key, const Slice& value) {
   if (key.size() > kMaxWriteBatchKeySize) {
@@ -864,16 +895,23 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
     return Status::InvalidArgument("value is too large");
   }
 
+  // 1. LocalSavePoint会保存当前kv序列化追加前的rep_ size/count/flag，用于后续超max size后恢复到之前的状态
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
+    // 2. 表示是put type，但是cf id为0
     b->rep_.push_back(static_cast<char>(kTypeValue));
   } else {
+    // 3. 表示是put type，但是cf id不为0，然后还需要把cf id序列化进去，
+    //    这个主要是为了用于WriteBatch和WAL中，最后真正写入memtable的时候
+    //    不需要再每个kv带上cf id，type也会改成kTypeValue
     b->rep_.push_back(static_cast<char>(kTypeColumnFamilyValue));
     PutVarint32(&b->rep_, column_family_id);
   }
+  // 4. 序列化kv本体
   PutLengthPrefixedSlice(&b->rep_, key);
   PutLengthPrefixedSlice(&b->rep_, value);
+  // 5. 写入operation types、prot_info旁路数据，方便后续进行一些检测和保护操作，这些数据不会跟随序列化和持久化
   b->content_flags_.store(
       b->content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_PUT,
       std::memory_order_relaxed);
@@ -888,6 +926,7 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
                                              .ProtectKVO(key, value, kTypeValue)
                                              .ProtectC(column_family_id));
   }
+  // 6. 检查序列化后rep_是否超max size，决定是否恢复到之前的状态
   return save.commit();
 }
 
@@ -933,6 +972,8 @@ Status WriteBatchInternal::TimedPut(WriteBatch* b, uint32_t column_family_id,
   return save.commit();
 }
 
+// 获取对应cf的cf_id以及ts_sz后，可能将ts_sz拼接到key（tikv场景不需要），
+// 然后将kv以put type序列化到WriteBatch的rep_缓冲区中。
 Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
                        const Slice& value) {
   size_t ts_sz = 0;
@@ -2024,7 +2065,10 @@ namespace {
 class MemTableInserter : public WriteBatch::Handler {
   SequenceNumber sequence_;
   ColumnFamilyMemTables* const cf_mems_;
+  // 负责cf的active memtable的full flush schedule，是所有模式下的刚需
   FlushScheduler* const flush_scheduler_;
+  // 负责trasaction事务模式下的history flushed immemtable的limit gc schedule，
+  // 普通的原子批写不需要用到这个东西
   TrimHistoryScheduler* const trim_history_scheduler_;
   const bool ignore_missing_column_families_;
   const uint64_t recovering_log_number_;
@@ -2044,6 +2088,11 @@ class MemTableInserter : public WriteBatch::Handler {
   // std::unique_ptr additional allocation
   using MemPostInfoMap = std::map<MemTable*, MemTablePostProcessInfo>;
   using PostMapType = aligned_storage<MemPostInfoMap>::type;
+  // ！！！
+  // 用于每个writer在写自己的WriteBatch到memtable的时候维护独自的对每个memtable的一些统计信息，
+  // 等后续写完WriteBatch之后再将统计信息中的结果atomic的写入每个memtable的统计信息中，避免多个writer
+  // 并发写memtable时每个kv都操作每个memtable的统计信息导致额外并发开销（例如cpu cache line 失效、
+  // cpu cache miss以及cpu缓存一致性协议开销）。
   PostMapType mem_post_info_map_;
   // current recovered transaction we are rebuilding (recovery)
   WriteBatch* rebuilding_trx_;
@@ -2066,6 +2115,9 @@ class MemTableInserter : public WriteBatch::Handler {
   // Hints for this batch
   using HintMap = std::unordered_map<MemTable*, void*>;
   using HintMapType = aligned_storage<HintMap>::type;
+  // ！！！
+  // 用于每个writer在写自己的WriteBatch到memtable的时候维护独自的对每个memtable skiplist的
+  // 上次插入位置，优化同个WriteBatch对同个memtable skiplist的顺序写，避免每次都从头O(logn)查找。
   HintMapType hint_;
 
   HintMap& GetHintMap() {
@@ -2233,8 +2285,17 @@ class MemTableInserter : public WriteBatch::Handler {
     bool found = cf_mems_->Seek(column_family_id);
     if (!found) {
       if (ignore_missing_column_families_) {
+        // cf找不到，但是ignore missing cf设置为true了，直接跳过返回ok，不影响当前WriteBatch其他操作也不影响其他writer和后续db的写请求
         *s = Status::OK();
       } else {
+        // cf找不到，并且没设置ignore missing cf，这里并不会自动创建CF，而是直接返回error status，这个error status后续会存在
+        // write group status中并引起DB实例进入fatal stopped状态，后续的所有写请求都会在PreprocessWrite阶段被拒绝，调用者只能关闭然后重新打开DB再做处理。
+        // ！！！
+        // 即使当前write group的部分内容已经写入memtable并触发了flush，但是真正的flush需要到下一次write请求的PreprocessWrite阶段的时候执行，
+        // 而后续的所有PreprocessWrite都会由于db fatal error直接拒绝写请求，更不会处理memtable flush。所以发生了statue error的write group
+        // 在当前的db打开实例中，已写入memtable的内容必然不会被flush持久化，但是WAL可能会存在。所以调用者下次再次打开DB新实例的时候，不能假设上
+        // 次的write group内容肯定不会再次被写入memtable，需要明确设置ignore missing cf，这样WAL中的write group在写memtable的时候可以跳过missing cf，
+        // 其他cf的写操作则是会成功。
         *s = Status::InvalidArgument(
             "Invalid column family specified in write batch");
       }
@@ -2256,6 +2317,8 @@ class MemTableInserter : public WriteBatch::Handler {
       // column family already contains updates from this log. We can't apply
       // updates twice because of update-in-place or merge workloads -- ignore
       // the update
+      // 崩溃恢复时，如果当前的恢复WAL log比当前的current cf的依赖log number要小，说明current cf中该内容已经
+      // 持久化到sst，不再重复执行，返回status ok然后跳过。
       *s = Status::OK();
       return false;
     }
@@ -2264,6 +2327,7 @@ class MemTableInserter : public WriteBatch::Handler {
       *has_valid_writes_ = true;
     }
 
+    // 非TransactionDB的普通写模式不需要这个
     if (log_number_ref_ > 0) {
       cf_mems_->GetMemTable()->RefLogContainingPrepSection(log_number_ref_);
     }
@@ -2277,6 +2341,7 @@ class MemTableInserter : public WriteBatch::Handler {
                    RebuildTxnOp rebuild_txn_op,
                    const ProtectionInfoKVOS64* kv_prot_info) {
     // optimize for non-recovery mode
+    // 非TransactionDB模式下的普通写不需要这个
     if (UNLIKELY(write_after_commit_ && rebuilding_trx_ != nullptr)) {
       // TODO(ajkr): propagate `ProtectionInfoKVOS64`.
       return rebuild_txn_op(rebuilding_trx_, column_family_id, key, value);
@@ -2284,6 +2349,7 @@ class MemTableInserter : public WriteBatch::Handler {
     }
 
     Status ret_status;
+    // 根据cf_id定位目标cf
     if (UNLIKELY(!SeekToColumnFamily(column_family_id, &ret_status))) {
       if (ret_status.ok() && rebuilding_trx_ != nullptr) {
         assert(!write_after_commit_);
@@ -2296,18 +2362,24 @@ class MemTableInserter : public WriteBatch::Handler {
           MaybeAdvanceSeq(IsDuplicateKeySeq(column_family_id, key));
         }
       } else if (ret_status.ok()) {
+        // 如果seek cf失败了，但是返回status ok，还是需要推进sequence number，同个writebatch下的其他kv正常执行，
+        // 当前的kv被安全跳过
         MaybeAdvanceSeq(false /* batch_boundary */);
       }
+      // 将结果返回给上层，如果ok就继续下一个kv，如果not ok就按fatal处理
       return ret_status;
     }
     assert(ret_status.ok());
 
+    // 成功获取到了目标cf（current cf）的memtable
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
     // inplace_update_support is inconsistent with snapshots, and therefore with
     // any kind of transactions including the ones that use seq_per_batch
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
     if (!moptions->inplace_update_support) {
+      // tikv场景下这个分支为LIKELY
+      // 不支持inplace update的普通写直接走这条分支将kv按指定type插入current memtable
       ret_status =
           mem->Add(sequence_, value_type, key, value, kv_prot_info,
                    concurrent_memtable_writes_, get_post_process_info(mem),
@@ -2399,12 +2471,20 @@ class MemTableInserter : public WriteBatch::Handler {
         }
       }
     }
+    // 检查memtable Add是否返回try again，表示memtable中已经存在了相同的user_key+sequence+type，
+    // 只有在seq_per_batch事务模式下才能发生。普通的原子批写不会发生这种情况。
     if (UNLIKELY(ret_status.IsTryAgain())) {
       assert(seq_per_batch_);
       const bool kBatchBoundary = true;
       MaybeAdvanceSeq(kBatchBoundary);
     } else if (ret_status.ok()) {
+      // memtable Add操作成功返回ok
+  
+      // 1. 普通的原子批写下，直接推进sequence number，下一个Iterate到的kv将使用新的sequence_。
       MaybeAdvanceSeq();
+      // 2. 检查memtable是否full了，如果是，就标记需要flush，但是不会马上同步进行flush，
+      //    而是需要等到后续调度（下一次DBImpl::WriteImpl的PreprocessWrite）。
+      // （事务模式下还会对内存hold住的history flushed immemtable list进行limit gc schedule，但是普通原子批写不需要）
       CheckMemtableFull();
     }
     // optimize for non-recovery mode
@@ -2412,6 +2492,7 @@ class MemTableInserter : public WriteBatch::Handler {
     // the key to the rebuilding transaction object. If `ret_status` is
     // another non-OK `Status`, then the `rebuilding_trx_` will be thrown
     // away. So we only need to add to it when `ret_status.ok()`.
+    // 只有Transaction recovery可能进入这个分支，普通的原子批写不需要走这个分支
     if (UNLIKELY(ret_status.ok() && rebuilding_trx_ != nullptr)) {
       assert(!write_after_commit_);
       // TODO(ajkr): propagate `ProtectionInfoKVOS64`.
@@ -2423,6 +2504,7 @@ class MemTableInserter : public WriteBatch::Handler {
 
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override {
+    // 获得当前kv的prot_info
     const auto* kv_prot_info = NextProtectionInfo();
     Status ret_status;
 
@@ -2433,6 +2515,8 @@ class MemTableInserter : public WriteBatch::Handler {
 
     if (kv_prot_info != nullptr) {
       // Memtable needs seqno, doesn't need CF ID
+      // 往memtable插入时已经指定了cf id，所以prot_info不需要cf id了，
+      // 而sequence_number是新需要的，所以需要把当前kv的sequence number编码进prot_info
       auto mem_kv_prot_info =
           kv_prot_info->StripC(column_family_id).ProtectS(sequence_);
       ret_status = PutCFImpl(column_family_id, key, value, kTypeValue,
@@ -2445,7 +2529,9 @@ class MemTableInserter : public WriteBatch::Handler {
     // the operation is actually tried again. The proper way to do this is to
     // pass a `try_again` parameter to the operation itself and decrement
     // prot_info_idx_ based on that
+    // 只有seg_per_batch模式的事务才会出现try again，普通的原子批写不会出现这种情况
     if (UNLIKELY(ret_status.IsTryAgain())) {
+      // 下次Iterate会复用当前的kv进行重试，所以需要把prot_info index复位
       DecrementProtectionInfoIdxForTryAgain();
     }
     return ret_status;
@@ -2983,17 +3069,30 @@ class MemTableInserter : public WriteBatch::Handler {
     return ret_status;
   }
 
+  // 当前WriteGroup的writer在成功执行对current memtable的Add插入操作后，通过该方法：
+  //   1. 检查memtable是否状态为FLUSH_REQUESTED需要进行flush
+  //   2. 设置memtable状态FLUSH_SCHEDULED，将current cfd插入flush scheduler的pending flush list中
+  //   3. 不执行真正flush，真正的flush需要等到下一个WriteGroup的PreProcessWrite中执行。
+  //      ！！！也就意味着，即使当前WriteGroup在Add到一半的时候memtable满了，当前WriteGroup也会全部
+  //      ！！！插入memtable，所以memtable的full flush上限并不是严格限制，实际允许超限。
   void CheckMemtableFull() {
+    // 1. 检测当前CF的active memtable是否需要full flush schedule，所有模式都需要
     if (flush_scheduler_ != nullptr) {
       auto* cfd = cf_mems_->current();
       assert(cfd != nullptr);
+      // 检查current memtable是否FLUSH_REQUESTED，并尝试cas成FLUSH_SCHEDULED
       if (cfd->mem()->ShouldScheduleFlush() &&
           cfd->mem()->MarkFlushScheduled()) {
         // MarkFlushScheduled only returns true if we are the one that
         // should take action, so no need to dedup further
+        // 在某个memtable在过去某个时刻被设置成FLUSH_REQUESTED之后，未来后续只有一个
+        // writer线程能够进来到这里并进行schedule，直到再下一次WriteGroup时PreProcessWrite
+        // 将该memtable switch/flush。所以理论上同个memtable不会存在重复schedule。
+        // active memtable full属于热路径，因此这里的schedule内部必须无锁并发
         flush_scheduler_->ScheduleWork(cfd);
       }
     }
+    // 2. 检测已经flushed但仍在内存中hold住的immemtable history list是否需要limit gc，只有事务模式需要
     // check if memtable_list size exceeds max_write_buffer_size_to_maintain
     if (trim_history_scheduler_ != nullptr) {
       auto* cfd = cf_mems_->current();
@@ -3003,6 +3102,7 @@ class MemTableInserter : public WriteBatch::Handler {
       const size_t size_to_maintain = static_cast<size_t>(
           cfd->ioptions().max_write_buffer_size_to_maintain);
 
+      // 普通的原子批写模式下，size_to_maintain直接就是0，不会进入到后续的schedule分支
       if (size_to_maintain > 0) {
         MemTableList* const imm = cfd->imm();
         assert(imm);
@@ -3015,6 +3115,8 @@ class MemTableInserter : public WriteBatch::Handler {
                       imm->MemoryAllocatedBytesExcludingLast() >=
                   size_to_maintain &&
               imm->MarkTrimHistoryNeeded()) {
+            // 由于只有事务模式下，且CF在内存中hold住的flushed history immemtable list超限时，
+            // 每个CF才可能对应只有一个writer进入到这里进行schedule，所以这个不是热路径，内部直接用mutex并发控制。
             trim_history_scheduler_->ScheduleWork(cfd);
           }
         }
@@ -3318,6 +3420,9 @@ Status WriteBatchInternal::InsertInto(
   Status s = writer->batch->Iterate(&inserter);
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
+  // 1. 允许多个writer线程并发写自身WriteBacth到memtable的情况下，每个writer在完成自己的WriteBacth之后，
+  //    需要将独自统计的各memtable统计信息atomic更新回各memtable内部。
+  // 2. 非并发memtable write则不需要，因为这时会在MemTable::Add()的时候直接更新各memtable的内部统计信息
   if (concurrent_memtable_writes) {
     inserter.PostProcess();
   }
@@ -3528,8 +3633,10 @@ Status WriteBatchInternal::UpdateProtectionInfo(WriteBatch* wb,
     }
   } else if (bytes_per_key == 8) {
     if (wb->prot_info_ == nullptr) {
+      //WriteOptions需要prot_info但是还没有，所以需要补上
       wb->prot_info_.reset(new WriteBatch::ProtectionInfo());
       ProtectionInfoUpdater prot_info_updater(wb->prot_info_.get());
+      // 使用WriteBatch::Iterate方法遍历所有record，并传入ProtectionInfoUpdater这个handler中进行处理，这个handler会为所有kv生成prot_info
       Status s = wb->Iterate(&prot_info_updater);
       if (s.ok() && checksum != nullptr) {
         uint64_t expected_hash = XXH3_64bits(wb->rep_.data(), wb->rep_.size());

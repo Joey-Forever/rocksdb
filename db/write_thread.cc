@@ -61,6 +61,10 @@ uint8_t WriteThread::BlockingAwaitState(Writer* w, uint8_t goal_mask) {
   return state;
 }
 
+// writer线程等待自己的状态变成goal_mask中的某一个状态，等待过程前后经历三个级别：
+// 1）CPU pause自旋
+// 2）自适应yield
+// 3）条件变量阻塞
 uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
                                 AdaptationContext* ctx) {
   uint8_t state = 0;
@@ -212,8 +216,12 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
 void WriteThread::SetState(Writer* w, uint8_t new_state) {
   assert(w);
   auto state = w->state.load(std::memory_order_acquire);
+  // SetState之所以有这一个if分支逻辑，是因为除了writer自己的线程需要设置自己的state外，
+  // leader/二级唤醒者也要使用这个方法设置其他writer的state然后唤醒该writer
   if (state == STATE_LOCKED_WAITING ||
+      // writer自己的线程在SetState的时候state必然不为STATE_LOCKED_WAITING，且这个CAS必然成功
       !w->state.compare_exchange_strong(state, new_state)) {
+    // 只有leader/二级唤醒者会进到这里，并且writer必须已经处于STATE_LOCKED_WAITING状态
     assert(state == STATE_LOCKED_WAITING);
 
     std::lock_guard<std::mutex> guard(w->StateMutex());
@@ -223,6 +231,9 @@ void WriteThread::SetState(Writer* w, uint8_t new_state) {
   }
 }
 
+// writer线程将自己的writer连接到链表上，采用的是将自己writer通过linker_older指针指向newest_writer，
+// 然后CAS赋值newest_writer为自己writer的方式，如果自己成为newest_writer之后，前一个writer是nullptr，
+// 自己就自动成为leader，返回true，否则返回false
 bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
   assert(newest_writer != nullptr);
   assert(w->state == STATE_INIT);
@@ -232,14 +243,20 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
     // If write stall in effect, and w->no_slowdown is not true,
     // block here until stall is cleared. If its true, then return
     // immediately
+    // ！！！
+    // 如果newest_writer是write stall标志项，就不能再插入链表了
     if (writers == &write_stall_dummy_) {
       if (w->no_slowdown) {
+        // writer自己选择不slowdown，直接设置Write Stall状态后返回。
         w->status = Status::Incomplete("Write stall");
+        // 直接设置STATE_COMPLETED后，后续的AwaitState可以直接返回
         SetState(w, STATE_COMPLETED);
         return false;
       }
       // Since no_slowdown is false, wait here to be notified of the write
       // stall clearing
+      // writer自己选择slowdown，所以需要wait在stall_cv_上，直到write stall标志项被清除后被唤醒
+      // 然后才可以继续往下执行插入链表操作
       {
         MutexLock lock(&stall_mu_);
         writers = newest_writer->load(std::memory_order_relaxed);
@@ -398,14 +415,25 @@ void WriteThread::WaitForStallEndedCount(uint64_t stall_count) {
 }
 
 static WriteThread::AdaptationContext jbg_ctx("JoinBatchGroup");
+// 1. 该方法用于阻塞性等待writer线程自己的writer成为以下state以确认自己在WriteGroup中的身份：
+//  1）STATE_GROUP_LEADER：自己成为了leader，返回后处理group
+//  2）STATE_COMPLETED：自己是follower但是被leader完成了所有的WAL+memtable写操作
+//  3）STATE_PARALLEL_MEMTABLE_WRITER：自己是follower并且WAL已经被leader写完但是memtable需要自己并行执行
+//  4）STATE_PARALLEL_MEMTABLE_CALLER：自己是follower并且WAL已经被leader写完然后作为二级唤醒者被唤醒，返回后
+//                                     负责STATE_PARALLEL_MEMTABLE_WRITER唤醒一批writer
+//  5）pipelined write下一些其他state
+// 2. 该方法同时也会进行write stall的等待行为，或者如果writer选择no-slowdown则会直接返回STATE_COMPLETED
 void WriteThread::JoinBatchGroup(Writer* w) {
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Start", w);
   assert(w->batch != nullptr);
 
+  // 将自己的writer插入链表中，并且返回是否自动成为leader的bool值。一个例外是，如果是write stall且writer自己选择了
+  // no_slowdown，则不会插入链表，但是会设置STATE_COMPLETED返回。
   bool linked_as_leader = LinkOne(w, &newest_writer_);
 
   w->CheckWriteEnqueuedCallback();
 
+  // 当前writer是整个链表的首个writer（更前只有nullptr），自动成为leader，然后回去处理group
   if (linked_as_leader) {
     SetState(w, STATE_GROUP_LEADER);
   }
@@ -413,6 +441,13 @@ void WriteThread::JoinBatchGroup(Writer* w) {
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait", w);
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait2", w);
 
+  // 当前writer并不是链表首个writer，无法自动成为leader，需要等待，正常情况下，等待这几种state：
+  // 1）STATE_GROUP_LEADER：被已存在leader提拨成为新leader，醒来后作为leader回去处理group
+  // 2）STATE_COMPLETED：自己writer的WAL+memtable已经作为Follower被前一个已存在leader给完成了
+  // 3）STATE_PARALLEL_MEMTABLE_WRITER：WAL已经被已存在leader完成，醒来后作为Follower回去并行写自己batch到memtable
+  // 4）STATE_PARALLEL_MEMTABLE_CALLER：WAL已经被已存在leader完成，但是整个writeGroup太大，当前writer作为二级唤醒者被唤醒
+  //                                   负责一批writer的STATE_PARALLEL_MEMTABLE_WRITER唤醒
+  // 5）其他一些pipelined write state
   if (!linked_as_leader) {
     /**
      * Wait util:
@@ -661,6 +696,10 @@ void WriteThread::ExitAsMemTableWriter(Writer* /*self*/,
   SetState(leader, STATE_COMPLETED);
 }
 
+// 1. writer线程自己作为二级唤醒者使用改方法负责将write group中一批writer唤醒为STATE_PARALLEL_MEMTABLE_WRITER，
+//    每个二级唤醒者每隔stride步（目前为sqrt n）唤醒一个writer，通过遍历整个write group然后count取余的方式，避免
+//    漏掉writer。
+// 2. 通过二级唤醒者，整个write group的唤醒操作的关键路径“取锁+原子操作+信号量notify”的总耗时从O(n)降到O(sqrt(n))
 void WriteThread::SetMemWritersEachStride(Writer* w) {
   WriteGroup* write_group = w->write_group;
   Writer* last_writer = write_group->last_writer;
@@ -668,6 +707,7 @@ void WriteThread::SetMemWritersEachStride(Writer* w) {
   // The stride is the same for each writer in write_group, so w will
   // call the writers with the same number in write_group mod total size
   size_t stride = static_cast<size_t>(std::sqrt(write_group->size));
+  // 从自己开始count为0，每往后遍历一个就count++，唤醒所有对stride取余为0的writer
   size_t count = 0;
   while (w) {
     if (count++ % stride == 0) {

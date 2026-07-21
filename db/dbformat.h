@@ -41,6 +41,10 @@ class InternalKey;
 enum ValueType : unsigned char {
   kTypeDeletion = 0x0,
   kTypeValue = 0x1,
+  // 对于value修改操作本身是可以不依赖原值而独立生成的增量内容，比如xor、+n、append、集合等。修改的时候可以不执行一次Read-Modify-Write操作，
+  // 而是可以直接写入增量Merge操作，避免前台写路径的RMW写冲突和随机读io。而把merge chain的operand合并转移到了后台常驻的compaction操作中，以及
+  // 真正读取操作的读放大中。当compaction比较及时的情况下，merge chain可能通过partial merge/full merge快速缩短和集中，从而优化读放大。
+  // JOEY_TODO: ordered write情况下只要WriteGroup中有merge操作就会导致串行memtable write，这个可以优化为cf max_successive_merges全为0时允许并发。
   kTypeMerge = 0x2,
   kTypeLogData = 0x3,               // WAL only.
   kTypeColumnFamilyDeletion = 0x4,  // WAL only.

@@ -216,6 +216,11 @@ void CompactedDBImpl::MultiGet(const ReadOptions& _read_options,
   }
 }
 
+// read-only db在open时通过该方法检测，是不是同时满足两个条件：
+//  1. 只有一层有数据
+//  2. 如果有数据的是L0，那只能有一个sst file
+////////////////////////////////////////////
+// 满足这些条件的话，说明该read-only db的所有read操作可以直接对一个连续有序区间执行一次二分搜索即可，不需要复杂的iterator。
 Status CompactedDBImpl::Init(const Options& options) {
   SuperVersionContext sv_context(/* create_superversion */ true);
   mutex_.Lock();

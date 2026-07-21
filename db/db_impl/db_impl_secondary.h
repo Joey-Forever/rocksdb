@@ -72,6 +72,8 @@ class LogReaderContainer {
 // that, it can call `DBImplSecondary::TryCatchUpWithPrimary` to make best
 // effort attempts to catch up with the primary.
 // TODO: Share common structure with CompactedDBImpl and DBImplReadOnly
+// 如果一个db正在被read-write open，其他进程可以通过open DBImplSecondary的方式同时打开这个DB的只读视图，
+// 并且过程中可以通过TryCatchUpWithPrimary的方式触发刷新视图
 class DBImplSecondary : public DBImpl {
  public:
   DBImplSecondary(const DBOptions& options, const std::string& dbname,

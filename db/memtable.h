@@ -635,6 +635,8 @@ class MemTable final : public ReadOnlyMemTable {
 
   // Returns true if a flush should be scheduled and the caller should
   // be the one to schedule it
+  // 通过expected为FLUSH_REQUESTED的cas操作，保证只有一个线程能够成功将flush state设置为
+  // FLUSH_SCHEDULED。
   bool MarkFlushScheduled() {
     auto before = FLUSH_REQUESTED;
     return flush_state_.compare_exchange_strong(before, FLUSH_SCHEDULED,
@@ -913,6 +915,15 @@ class MemTable final : public ReadOnlyMemTable {
   AllocTracker mem_tracker_;
   ConcurrentArena arena_;
   std::unique_ptr<MemTableRep> table_;
+  // ！！！
+  // 区别于table_用于单key的put、delete、merge的point entry语义，range_del_table_的每个entry描述的不是单个key的版本内容，而是一个区间的deletion情况，例如“key = b@sequence_kTypeRangeDeletion, value = f”
+  // 表示的是[b，f)这个数据区间被删除并且对>=sequence的snapshot read可见。
+  //  1. 由于需要维护tombstone区间的有序语义以作为MergingIterator的辅助iterator，所以range_del_table_默认只能使用skiplist。
+  //  2. 对于iterator read，range_del_table_可以帮助快速seek跳过明确被删除的区间。
+  //  3. flush时，range_del_table_作为sst的rocksdb.range_del meta block被记录，并且参与到sst的区间范围表示中。
+  //  4. range_del_table_也要遵循“更新sst的sequence比更旧sst的sequence更新”的核心假设，当snapshot read在更新的sst中可见了某个range tombstone，更旧的sst就不会被搜索。因此在读路径的
+  //     AddLogicallyRedundantRangeTombstone优化中，需要确保snapshot sequence range tombstone比旧sst的sequence都要大，否则就中断插入优化。
+  //  5. 由于读路径的AddLogicallyRedundantRangeTombstone优化会导致读路径也会并发写range_del_table_，所以所有kTypeRangeDeletion类型的memtable write操作都要强制使用concurrent insert。
   std::unique_ptr<MemTableRep> range_del_table_;
   // This is OK to be relaxed access because consistency between table_ and
   // range_del_table_ is provided by explicit multi-versioning with sequence
@@ -928,6 +939,9 @@ class MemTable final : public ReadOnlyMemTable {
   port::RWMutex immutable_mutex_;
 
   // Total data size of all data inserted
+  // 这四个不存在false sharing关系，多个线程基本都是需要同时读写四个，所以是true sharing，
+  // 因此不需要为每个变量独占cpu cache line。四个尽可能位于同一个cache line反而可以减少
+  // cache line失效时的缓存一致性协议开销，而且减少内存占用。
   RelaxedAtomic<uint64_t> data_size_;
   RelaxedAtomic<uint64_t> num_entries_;
   RelaxedAtomic<uint64_t> num_deletes_;
