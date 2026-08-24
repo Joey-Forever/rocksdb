@@ -981,6 +981,10 @@ class MemTable final : public ReadOnlyMemTable {
   const SliceTransform* insert_with_hint_prefix_extractor_;
 
   // Insert hints for each prefix.
+  // ！！！
+  // Memtable级别的insert hint，只有在串行memtable write的时候使用这个，因为要避免多线程并发修改hint splice。
+  // 他实现的是per prefix级别的hint，比WriteBatch hint的per memtable要更细，局部性效果也要更好，而且他跟随的是MemTable
+  // 的生命周期，意味着不同的writegroup都可以复用他，也使得他能够做到跨WriteBatch积累局部性。
   UnorderedMapH<Slice, void*, SliceHasher32> insert_hints_;
 
   // Timestamp of oldest key

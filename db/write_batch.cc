@@ -2116,6 +2116,7 @@ class MemTableInserter : public WriteBatch::Handler {
   using HintMap = std::unordered_map<MemTable*, void*>;
   using HintMapType = aligned_storage<HintMap>::type;
   // ！！！
+  // concurrent memtable write的情况下才使用这个。
   // 用于每个writer在写自己的WriteBatch到memtable的时候维护独自的对每个memtable skiplist的
   // 上次插入位置，优化同个WriteBatch对同个memtable skiplist的顺序写，避免每次都从头O(logn)查找。
   HintMapType hint_;
