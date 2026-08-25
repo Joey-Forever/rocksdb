@@ -2566,9 +2566,11 @@ struct WriteOptions {
   // Default: false
   // 调用者调用DBImpl::Write将一个构造好的WriteBatch直接写入数据库，可以设置WriteOptions的memtable_insert_hint_per_batch
   // 为true，用于concurrent memtable write时的WriteBatch级别hint优化。
-  // ！！！需要注意的是，在串行Memtable write情况下，这个会被ignore，而是使用更高效的Memtable级别的prefix hint。
-  //      Memtbale prefix hint粒度更细也更持久，而这个WriteBatch hint有以下缺点：
-  //      1）粒度粗导致局部性差。而且当前的WriteBatch结束之后就会失效，无法做到跨WriteBatch积累局部性。
+  // ！！！需要注意的是，在串行Memtable write情况下，这个会被ignore，而是使用更高效的Memtable级别的prefix hint，
+  //      Memtbale prefix hint粒度更细也更持久。而这个WriteBatch hint最大的优点就是，通过低成本满足了局部性较好的大WriteBatch的
+  //      hint需求，所以有以下缺点：
+  //      1）粒度粗导致局部性更差。而且当前的WriteBatch结束之后就会失效，无法做到跨WriteBatch积累局部性。
+  //      2）WriteBatch hint有效的前提是WritBatch本身整体具有较好的局部性。
   //      2）WriteBatch太小时，固定的hint map维护以及splice检测成本难以摊薄。
   //      3）其他writer并发写入的时候会使已有的hint被污染，从而削弱效果。
   bool memtable_insert_hint_per_batch = false;

@@ -31,6 +31,7 @@ class Logger;
 // For simplicity and performance, the current implementation requires
 // num_probes to be a multiple of two and <= 10.
 //
+// JOEY_TODO: 看到这里
 class DynamicBloom {
  public:
   // allocator: pass allocator to bloom filter, hence trace the usage of memory

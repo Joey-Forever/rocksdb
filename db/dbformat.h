@@ -50,6 +50,10 @@ enum ValueType : unsigned char {
   kTypeColumnFamilyDeletion = 0x4,  // WAL only.
   kTypeColumnFamilyValue = 0x5,     // WAL only.
   kTypeColumnFamilyMerge = 0x6,     // WAL only.
+  // 当上层能够保证某个key只执行过一次put操作，在删除的时候可以调用kTypeSingleDeletion进行delete。
+  //  1. 在没有snapshot read等情况的阻挡下，这能够让compaction在看到single deletion + put两个配对的时候直接物理删除两者，
+  //     减少无效记录和tombstone的保留时间，对缓解读放大、写放大和空间放大都有好处。
+  //  2. 如果key有多次put或者存在merge，就必须只能用kTypeDeletion，并且compaction需要确保更下层不存在遗留旧版本时才可以物理删除tombstone。
   kTypeSingleDeletion = 0x7,
   kTypeColumnFamilySingleDeletion = 0x8,  // WAL only.
   kTypeBeginPrepareXID = 0x9,             // WAL only.

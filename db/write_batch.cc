@@ -2114,11 +2114,19 @@ class MemTableInserter : public WriteBatch::Handler {
   bool hint_created_;
   // Hints for this batch
   using HintMap = std::unordered_map<MemTable*, void*>;
+  // ！！！
+  // 使用aligned_storage<HintMap>::type的方式，使得hint_成员变量构造的时候
+  // 只是占位了一个空的已对齐字节容器，而不会直接对HintMap实例本身进行构造，
+  //  1. 避免不需要使用hint_的inserter也进行map的构造，造成额外开销，这样可以最大程度减小对不需要情况的影响
+  //  2. 真正需要使用hint_的inserter需要在使用之前使用placement new在该字节容器上先构造map实例
+  //  3. 由于HintMapType类型本身只认识char[]这个容器本身，不认识HintMap这个实际的功能类型，所以在析构hint_成员之前需要
+  //     手动调用~HintMap对map实际功能类型进行析构。
   using HintMapType = aligned_storage<HintMap>::type;
   // ！！！
   // concurrent memtable write的情况下才使用这个。
   // 用于每个writer在写自己的WriteBatch到memtable的时候维护独自的对每个memtable skiplist的
   // 上次插入位置，优化同个WriteBatch对同个memtable skiplist的顺序写，避免每次都从头O(logn)查找。
+  // 详见WriteOptions.memtable_insert_hint_per_batch注释
   HintMapType hint_;
 
   HintMap& GetHintMap() {
