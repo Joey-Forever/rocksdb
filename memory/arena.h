@@ -32,7 +32,13 @@ class Arena : public Allocator {
   static constexpr size_t kMinBlockSize = 4096;
   static constexpr size_t kMaxBlockSize = 2u << 30;
 
+  // ！！！
+  // AllocateAligned是固定按照kAlignUnit来对齐每个内存分配区域首地址的，不会感知上层需要的类型精确Alignment，
+  // 所以如果上层能够确定自己需要的对齐小于这个数的话，可以直接AllocateAligned就可以使用，否则的话就会发生over-aligned，
+  // 必须要上层自己在Allocate超额空间后手动对齐。（像语言和编译器层面的直接对类型本身进行栈堆分配这种能够明确感知类型精确Alignment的
+  // 才可以内置就解决了这种over-aligned）
   static constexpr unsigned kAlignUnit = alignof(std::max_align_t);
+  // 对齐值必须是2的幂次方，方便位运算
   static_assert((kAlignUnit & (kAlignUnit - 1)) == 0,
                 "Pointer size should be power of 2");
 
@@ -88,6 +94,8 @@ class Arena : public Allocator {
   static size_t OptimizeBlockSize(size_t block_size);
 
  private:
+  // Arena在自身实例中内嵌一个对齐的2kb初始block用于小Arena的使用。
+  // 只有在这个内嵌block用完后才会去堆上申请新block，避免小Arena频繁到堆上申请内存。
   alignas(std::max_align_t) char inline_block_[kInlineSize];
   // Number of bytes allocated in one block
   const size_t kBlockSize;
@@ -102,6 +110,8 @@ class Arena : public Allocator {
   // allocate unaligned memory chucks from the other end. Otherwise the
   // memory waste for alignment will be higher if we allocate both types of
   // memory from one direction.
+  // 将AllocateAligned和不要求对齐的Allocate分别从active block的两个方向开始分配。
+  // 避免混合分配时导致AllocateAligned造成过多内存浪费。
   char* unaligned_alloc_ptr_ = nullptr;
   char* aligned_alloc_ptr_ = nullptr;
   // How many bytes left in currently active block?
@@ -119,6 +129,8 @@ class Arena : public Allocator {
   AllocTracker* tracker_;
 };
 
+// 分配一块没有任何对齐要求的bytes大小内存区域。
+// 从active block的高地址到低地址分配。
 inline char* Arena::Allocate(size_t bytes) {
   // The semantics of what to return are a bit messy if we allow
   // 0-byte allocations, so we disallow them here (we don't need
