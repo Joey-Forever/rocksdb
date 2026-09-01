@@ -60,8 +60,8 @@ namespace ROCKSDB_NAMESPACE {
 //     VMA本身作为进程虚拟地址空间分配区域的语义管理结构，他在虚拟地址空间中也具有聚簇性和簇内连续性，但是他并不是多区间稀疏数组，因为
 //     每个VMA的key并不是单一的页偏移值，而是一个区间，比如多个VMA连续分布，VMA_1[100, 1000), VMA_2[1001, 2000)，如果将这两个
 //     VMA区间的左右边界插入朴素Radix Tree中，那Radix Tree视角下的key在末级节点中就会表现为极度稀疏分布，空间极大浪费。因此，VMA索引
-//     结构还是需要使用基于key compare的数据结构了，例如平衡树（查找性能稳定和子树聚合值增强，btree（缓存局部性和矮树高）、rbtree（稳定迭代器和intrusive
-//     无额外节点分配））、skiplist（高并发写和高效hint）。
+//     结构还是需要使用基于key compare的数据结构了，例如平衡树（查找性能稳定和子树不可逆聚合值增强，btree（TLB/CPU cache line缓存局部
+//     性和矮树高）、rbtree（稳定迭代器和intrusive无额外节点分配））、skiplist（高并发写和高效hint）。
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
