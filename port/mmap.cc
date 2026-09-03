@@ -78,6 +78,10 @@ MemMapping MemMapping::AllocateAnonymous(size_t length, bool huge) {
     huge_flag = MAP_HUGETLB;
 #endif  // MAP_HUGE_TLB
   }
+  // ！！！
+  // 这里设置了MAP_HUGETLB的话，mmap会按照操作系统默认的大页size进行对齐分配。
+  // 所以使用huge page分配之前务必先向系统预留足够的大页并得知默认huge page size。
+  // 避免后续的munmap失败。
   mm.addr_ = mmap(nullptr, length, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | huge_flag, -1, 0);
   if (mm.addr_ == MAP_FAILED) {
