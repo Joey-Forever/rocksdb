@@ -34,6 +34,9 @@ size_t Arena::OptimizeBlockSize(size_t block_size) {
   return block_size;
 }
 
+ // ！！！
+// 上层调用方务必保证传递的huge page size是系统默认的huge page size，
+// 且已经向系统预留了足够的huge page物理内存
 Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
     : kBlockSize(OptimizeBlockSize(block_size)), tracker_(tracker) {
   assert(kBlockSize >= kMinBlockSize && kBlockSize <= kMaxBlockSize &&
@@ -45,6 +48,8 @@ Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
   unaligned_alloc_ptr_ = inline_block_ + alloc_bytes_remaining_;
   if (MemMapping::kHugePageSupported) {
     hugetlb_size_ = huge_page_size;
+    // ！！！
+    // 使hugetlb_size_ >= kBlockSize且为系统默认huge page size的整数倍。
     if (hugetlb_size_ && kBlockSize > hugetlb_size_) {
       hugetlb_size_ = ((kBlockSize - 1U) / hugetlb_size_ + 1U) * hugetlb_size_;
     }
@@ -61,6 +66,9 @@ Arena::~Arena() {
   }
 }
 
+// active block空间不足时，Arena调用该方法申请新的active block，
+// 然后马上从新active block分配目标size空间给上层。
+// JOEY_TODO: 看到这里
 char* Arena::AllocateFallback(size_t bytes, bool aligned) {
   if (bytes > kBlockSize / 4) {
     ++irregular_block_num;

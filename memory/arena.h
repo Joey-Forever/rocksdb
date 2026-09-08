@@ -77,10 +77,38 @@ namespace ROCKSDB_NAMESPACE {
 //     2） 每个进程的虚拟地址空间都分为低地址的user space和高地址的kernel space，其中kernel space是所有进程共享的。
 //     3） .text、.rodata、.data、.bss这几个段是可执行程序装载之后被VMA映射到进程虚拟地址空间的，.text映射的是代码指令，.rodata映射的是只读的initiaized静态变量
 //         和无法被直接编译进指令的字面量，.data映射的是可写的非0 initialized静态变量，.bss映射的是可写的uninitialized静态变量和可写的0 initailized静态变量。
+//         还有一种常见情况时，即使静态变量有初始化值，但是该初始化值必须在运行时才能计算出来，那该值也会存在.bss等到运行时的初始化代码中才初始化。而使用constexpr修饰的静态变量
+//         必须能够在编译期确定const值。constexpr修饰的函数可以嵌套非constexpr函数，而如果一个变量的初始化值调用到该constexpr函数而且所有调用路径都是constexpr函数，
+//         就可以在编译期直接生成该变量初始化值，否则的话对于constexpr变量直接编译错误，对于非constexpr变量则等到运行时再计算。
 //     4） .text、.rodata直接PROT_READ只读映射page cache中的可执行文件对应页，而.data则通过PROT_WRITE｜PROT_READ｜MAP_PRIVATE读写私有映射page cache中
 //         可执行文件对应页，当需要写.data中的内容时，会触发COW重新映射到进程私有的anonymous page，修改不会被同步回可执行文件。
 //     5） 和前几个段不同的是，.bss段的实际对象内容不会存储到可执行文件中（因为全0），可执行文件只保留基础的.bss描述信息用于程序装载时进行映射。因此在访问.bss段地址处
 //         理page fault时，只需要映射共享只读0页或者直接映射私有的清零anonymous page，不再需要可执行文件在page cache中的内容。
+//  8. 进程页表格局：
+//         进程 A 的页表根                                进程 B 的页表根
+//      低地址表项 → A 的user_space页表              低地址表项 → B 的user_space页表
+//      高地址表项 ──────────┐         ┌─────────── 高地址表项
+//                         ↓         ↓
+//                   共享的kernel_space下级页表 ==> 非KPTI情况下，这个始终包含内核空间的完整映射，
+//                              ↓                 KPTI情况下，用户态时这里只映射少量内核入口代码
+//                          内核物理页面
+//      用户态 -> 内核态的切换逻辑：
+//      1） CPU在进程用户态执行过程中碰到"syscall/中断/异常"就会触发陷入内核态。
+//      2） CPU硬件层面完成内核态权限转换、执行指令地址转到内核入口代码等一整套受控操作。
+//      3） CPU已经处于内核态，开始执行内核入口代码，此时使用的页表和用户态时仍为同一个。
+//      4） KPTI情况下，执行内核入口代码时会将页表切换到具有完整内核映射的页表。
+//      5） 执行内核具体处理逻辑，此时使用的是当前已经具有完整内核映射的页表。
+//  9. 进程页表KPTI优化：
+//    1）必要性：传统的进程页表布局方式中，用户空间和内核空间的完整映射都在同一个页表中，共享内核映射的TLB entry也会开启global优化以
+//             实现多进程共享。但是这有个致命问题是，用户态和内核内存资源映射之间只有一层脆弱的权限保护，会被Meltdown漏洞突破。
+//    2）实现手段：用户态使用的用户页表只有少量的内核入口代码映射，真正进入内核态切换到内核页表后，才有完整的内核空间映射。禁用共享内核
+//               映射的global TLB entry优化（针对没有同时映射到两套页表的内核页面），避免用户态切回用户页表后仍能通过global TLB
+//               entry获取内核虚拟页映射。通过这两个手段实现了用户态和内核映射之间真正的物理隔离。
+//    3）PCID机制：KPTI的开启时，每次切换用户态内核态都要切换页表，即使前后两个页表的下级页表可能相同，“虚拟内存->物理内存，权限”的
+//               映射关系也相同，但是在CPU看来该进程切换了页表后会使旧页表的TLB cache全部失效。所以需要使用PCID机制为两个页表分别
+//               保留CPU TLB cache，切到内核页表时，用户页表TLB仍然保留不主动失效，降低切回用户态后的TLB miss。
+//    4）代价：KPTI+PCID机制下，内核态访问用户空间虚拟页时会导致TLB中存在两条重复（不同PCID）的TLB entry；KPTI会禁用共享内核映射的
+//           global TLB entry优化，这就导致了不同进程需要有独立的内核虚拟页映射TLB entry。两个因素叠加之下，加剧了TLB cache容量竞争。
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
@@ -96,7 +124,6 @@ namespace ROCKSDB_NAMESPACE {
 //   3） 内部单slot占用节点路径压缩（Path Compression），如果某些key在结构上存在公共前缀，那可能会产生许多只有一个占用slot的内部节点，这些内部节点唯一占用slot的内容可以直接下压进唯一child节点的节点级prefix字段中
 //      （prefix字段是所有类型Node都有，包括Node256），从而进一步压缩整体内存开销。而在随机work load下，内部节点的扇出率本身比较高，这种单slot占用节点出现的概率就非常小了，路径压缩的优化空间就很小了。
 //   4） 前两个方法已经能够基本解决朴素Radix Tree在随机work load下的空间浪费，第三个方法更多是针对公共前缀较多的key分布做的进一步空间极限压缩。
-// JOEY_TODO:看到这里
 class Arena : public Allocator {
  public:
   // No copying allowed
@@ -192,6 +219,11 @@ class Arena : public Allocator {
   // How many bytes left in currently active block?
   size_t alloc_bytes_remaining_ = 0;
 
+  // 当active block没有足够空间分配的时候，AllocateFallback会优先考虑向系统mmap申请
+  // huge page粒度的新active block。hugetlb_size_就是每次申请该类型active block时的size。
+  // 因此该值需要满足两个条件：
+  //  1） 必须大于等于kBlockSize
+  //  2） 必须是系统默认huge page size的整数倍（避免munmap失败）
   size_t hugetlb_size_ = 0;
 
   char* AllocateFromHugePage(size_t bytes);
@@ -211,11 +243,13 @@ inline char* Arena::Allocate(size_t bytes) {
   // 0-byte allocations, so we disallow them here (we don't need
   // them for our internal use).
   assert(bytes > 0);
+  // 1. active block中有剩余空间，直接分配
   if (bytes <= alloc_bytes_remaining_) {
     unaligned_alloc_ptr_ -= bytes;
     alloc_bytes_remaining_ -= bytes;
     return unaligned_alloc_ptr_;
   }
+  // 2. active block空间不足，需要申请新active block再获取分配空间
   return AllocateFallback(bytes, false /* unaligned */);
 }
 
