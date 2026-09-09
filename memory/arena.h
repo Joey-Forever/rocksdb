@@ -124,6 +124,17 @@ namespace ROCKSDB_NAMESPACE {
 //   3） 内部单slot占用节点路径压缩（Path Compression），如果某些key在结构上存在公共前缀，那可能会产生许多只有一个占用slot的内部节点，这些内部节点唯一占用slot的内容可以直接下压进唯一child节点的节点级prefix字段中
 //      （prefix字段是所有类型Node都有，包括Node256），从而进一步压缩整体内存开销。而在随机work load下，内部节点的扇出率本身比较高，这种单slot占用节点出现的概率就非常小了，路径压缩的优化空间就很小了。
 //   4） 前两个方法已经能够基本解决朴素Radix Tree在随机work load下的空间浪费，第三个方法更多是针对公共前缀较多的key分布做的进一步空间极限压缩。
+
+
+// Arena是一个针对memtable场景的一个支持std::max_align_t默认对齐（不处理over-aligned）的内存分配器，他的特点是生命周期和
+// memtable绑定，而且memtable是一个对元素只add不delete的数据结构，Arena分配给memtable的所有内存只会随着memtable的销毁整体释放，
+// 也就意味着Arena不需要处理小块的回收和复用问题，因此：
+//   1） 分配小块只需要在active block下一个分配位置直接取align后的目标addr，不需要为零散free的小块维护多个固定size的free list便于复用。
+//   2） 返回给上层申请者的小块不需要在返回地址前维护所属小块在free list中的所属size、list ptr、各种管理标志位等信息。
+//   3） PS：glibc的malloc分配器支持std::max_align_t对齐，但是由于他不需要处理任意的对齐，所以不需要在每个小块header处预留
+//          ”align - 1 + raw_ptr size + raw size”的超额空间，假设std::max_align_t是16，他保证每个小块首地址和size都
+//          对齐到16，然后小块分配给上层时返回的是“首地址+16”的addr，然后小块header的16字节用于记录小块的raw size和一些flag bits。
+//          free时通过“上层ptr-16”就找到了块头。相当于通过固定的16对齐避免了额外的“align - 1 + raw_ptr_size”的超额空间。
 class Arena : public Allocator {
  public:
   // No copying allowed
@@ -137,8 +148,8 @@ class Arena : public Allocator {
   // ！！！
   // AllocateAligned是固定按照kAlignUnit来对齐每个内存分配区域首地址的，不会感知上层需要的类型精确Alignment，
   // 所以如果上层能够确定自己需要的对齐小于这个数的话，可以直接AllocateAligned就可以使用，否则的话就会发生over-aligned，
-  // 必须要上层自己在Allocate超额空间后手动对齐。（像语言和编译器层面的直接对类型本身进行栈堆分配这种能够明确感知类型精确Alignment的
-  // 才可以内置就解决了这种over-aligned）
+  // 必须要上层自己在Allocate超额空间（至少“align - 1 + raw_ptr size”）后手动对齐。（像语言和编译器层面的直接对类型本
+  // 身进行栈堆分配这种能够明确感知类型精确Alignment的才可以内置就解决了这种over-aligned）
   static constexpr unsigned kAlignUnit = alignof(std::max_align_t);
   // 对齐值必须是2的幂次方，方便位运算
   static_assert((kAlignUnit & (kAlignUnit - 1)) == 0,
@@ -198,12 +209,16 @@ class Arena : public Allocator {
  private:
   // Arena在自身实例中内嵌一个对齐的2kb初始block用于小Arena的使用。
   // 只有在这个内嵌block用完后才会去堆上申请新block，避免小Arena频繁到堆上申请内存。
+  // 需要满足按照std::max_align_t对齐
   alignas(std::max_align_t) char inline_block_[kInlineSize];
   // Number of bytes allocated in one block
   const size_t kBlockSize;
   // Allocated memory blocks
+  // normal block通过new关键字（本质是malloc）分配，本身就保证了首地址至少按照std::max_align_t对齐了。
   std::deque<std::unique_ptr<char[]>> blocks_;
   // Huge page allocations
+  // huge block通过mmap系统调用直接映射分配，保证首地址是按照系统默认huge page size对齐了，也就是自然
+  // 按照std::max_align_t对齐了。
   std::deque<MemMapping> huge_blocks_;
   size_t irregular_block_num = 0;
 
@@ -213,7 +228,8 @@ class Arena : public Allocator {
   // memory waste for alignment will be higher if we allocate both types of
   // memory from one direction.
   // 将AllocateAligned和不要求对齐的Allocate分别从active block的两个方向开始分配。
-  // 避免混合分配时导致AllocateAligned造成过多内存浪费。
+  // 避免混合分配时导致AllocateAligned造成过多内存浪费。缺点是，如果某一边只有很少的
+  // 分配请求，可能额外提前占用4kb/huge page的物理内存。
   char* unaligned_alloc_ptr_ = nullptr;
   char* aligned_alloc_ptr_ = nullptr;
   // How many bytes left in currently active block?

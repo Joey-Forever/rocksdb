@@ -68,12 +68,18 @@ Arena::~Arena() {
 
 // active block空间不足时，Arena调用该方法申请新的active block，
 // 然后马上从新active block分配目标size空间给上层。
-// JOEY_TODO: 看到这里
+// ！！！
+// 分配的新active block不可以进行任何形式的整块初始化/触页，因为这可能导致：
+//   1. 触发整个block所有page的“缺页异常->进入内核态分配物理页->建立页表物理映射->初始化CPU开销”，
+//      将所有开销都积压到了上层当前这次内存申请上，造成延迟尖峰。
+//   2. block其他page还没被使用就先占用了物理内存，提前增加RSS。
 char* Arena::AllocateFallback(size_t bytes, bool aligned) {
+  // 上层申请的空间过大，直接为其单独分配一块irregular block
   if (bytes > kBlockSize / 4) {
     ++irregular_block_num;
     // Object is more than a quarter of our block size.  Allocate it separately
     // to avoid wasting too much space in leftover bytes.
+    // new关键字本身保证了分配的内存首地址是至少std::max_align_t对齐的，所以不需要检查aligned了。
     return AllocateNewBlock(bytes);
   }
 
@@ -101,6 +107,10 @@ char* Arena::AllocateFallback(size_t bytes, bool aligned) {
   }
 }
 
+// 使用mmap系统调用直接向系统申请huge active block。
+// ！！！
+// 调用者必须保证bytes参数是系统默认huge page size的整数倍，避免munmap失败。
+// JOEY_TODO: 看到这里
 char* Arena::AllocateFromHugePage(size_t bytes) {
   MemMapping mm = MemMapping::AllocateHuge(bytes);
   auto addr = static_cast<char*>(mm.Get());
@@ -154,14 +164,22 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
   return result;
 }
 
+// 使用new关键字（malloc）内存分配器申请新的normal active block,
+// 相当于在上层与brk/mmap系统调用之间隔了一层ptmalloc用户态内存分配器，减少系统调用的开销。
 char* Arena::AllocateNewBlock(size_t block_bytes) {
   // NOTE: std::make_unique zero-initializes the block so is not appropriate
   // here
+  // new关键字本身通过malloc分配器保证了首地址至少按照std::max_align_t对齐了
   char* block = new char[block_bytes];
+  // 由于std::make_unique会对分配区域进行全0初始化，导致提前整block触页，所以不可以使用。
   blocks_.push_back(std::unique_ptr<char[]>(block));
 
+  // allocated_size只用于Arena占用虚拟内存记账统计。
   size_t allocated_size;
 #ifdef ROCKSDB_MALLOC_USABLE_SIZE
+  // malloc内存分配器分配给上层的小块中除了上层要求的block_bytes之外，
+  // 还包括固定size开销、块header对齐和管理开销，通过malloc_usable_size
+  // 能够更精确的获取本次申请实际占用的allocated_size。
   allocated_size = malloc_usable_size(block);
 #ifndef NDEBUG
   // It's hard to predict what malloc_usable_size() returns.
