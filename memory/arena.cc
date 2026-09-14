@@ -74,7 +74,12 @@ Arena::~Arena() {
 //      将所有开销都积压到了上层当前这次内存申请上，造成延迟尖峰。
 //   2. block其他page还没被使用就先占用了物理内存，提前增加RSS。
 char* Arena::AllocateFallback(size_t bytes, bool aligned) {
-  // 上层申请的空间过大，直接为其单独分配一块irregular block
+  // 上层申请的空间过大，直接为其单独malloc irregular block，当前的active block继续服务后续的小申请，
+  // 避免直接新建block导致当前active block浪费空间过多。
+  // ！！！
+  // 事实上，在实际MemTable使用中，对于BloomFilter位数组、hash桶数组这些大请求，在允许huge page情况下，
+  // 基本都在更前面的AllocateAligned方法开始时就单独huge mmap分配了，连active block都不会尝试。只有当huge page
+  // 失败/不允许且active block确实装不下时，才可能走到这条路径。
   if (bytes > kBlockSize / 4) {
     ++irregular_block_num;
     // Object is more than a quarter of our block size.  Allocate it separately
@@ -140,7 +145,8 @@ char* Arena::AllocateFromHugePage(size_t bytes) {
 //    所以这类场景下需要独立huge page分配区域，减少TLB entry数目以缓解TLB miss。
 char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
                              Logger* logger) {
-  // 1. 针对“较大区域的频繁随机访问”独立分配huge page粒度区域（自动对齐了std::max_align_t）
+  // 1. 针对“较大区域的频繁随机访问”独立分配huge page粒度区域（自动对齐了std::max_align_t），这个分枝早于尝试active block，
+  //    避免大请求打乱active block内部的小请求分配对齐。
   if (MemMapping::kHugePageSupported && hugetlb_size_ > 0 &&
       // 上层同样需要保证传入的huge_page_size等于系统默认huge page size
       huge_page_size > 0 && bytes > 0) {
@@ -156,6 +162,9 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
                      "AllocateAligned fail to allocate huge TLB pages: %s",
                      errnoStr(errno).c_str());
       // fail back to malloc
+      // 后续会有两种可能：
+      //  1） active block能装下该大请求，直接分配，但是会打乱active block内部对小请求的分配对齐，造成不必要的空间浪费
+      //  2） active block也装不下了，且大请求大于1/4 block，直接单独malloc irregular block，当前active block继续服务小请求，避免当前active block浪费过多空间
     } else {
       return addr;
     }
