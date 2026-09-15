@@ -109,6 +109,72 @@ namespace ROCKSDB_NAMESPACE {
 //               保留CPU TLB cache，切到内核页表时，用户页表TLB仍然保留不主动失效，降低切回用户态后的TLB miss。
 //    4）代价：KPTI+PCID机制下，内核态访问用户空间虚拟页时会导致TLB中存在两条重复（不同PCID）的TLB entry；KPTI会禁用共享内核映射的
 //           global TLB entry优化，这就导致了不同进程需要有独立的内核虚拟页映射TLB entry。两个因素叠加之下，加剧了TLB cache容量竞争。
+//  10. glibc malloc内存分配器原理：
+//    1） 堆chunk内部结构（std::max_align_t = 16）：
+//         |<------ chunk 1 (n * 16B)------->|<------ chunk 2 (m * 16B)------->|<------ chunk 3 (p * 16B)------->|
+//         ┌─────┬─────────┬─────────────────┬─────┬─────────┬─────────────────┬─────┬─────────┬─────────────────┐
+//         │prev │this_size│      user       │prev │this_size│      user       │prev │this_size│      user       │
+//     ... │size │ + flags │      space      │size │ + flags │      space      │size │ + flags │      space      │ ...
+//         └─────┴─────────┴─────────────────┴─────┴─────────┴─────────────────┴─────┴─────────┴─────────────────┘
+//           8B      8B      this_size - 16B    8B      8B      this_size - 16B    8B      8B      this_size - 16B
+//                         <----- true use 1 ------>         <----- true use 2 ------>         <----- true use 3 ------> 
+//       chunk_addr和chunk_size都需要按照16对齐，回收/复用结构管理chunk是按照原始chunk_size来管理，返回给上层用户的地址是
+//       “chunk_addr+16”，用户能够使用的为"当前chunk的user_space+下一个chunk的prev_size"，因此每个chunk固定浪费8B。
+//    2） 假设上层用户需要使用n字节：
+//          chunk_size = ceil_to_16_multi(n + 8)，需要分配size >= chunk_size的chunk
+//          space_wasted = chunk_size - n，下一个chunk的prev_size字段是算进当前chunk的user浪费的
+//       当实际分配的chunk大于所需的chunk_size时，需要进行切分，但是要保证切分后的new_chunk_size >= 32。
+//    3） chunk2空闲需要合并时如何找到chunk1和chunk3:
+//       找chunk1: chunk2的flags中的PREV_INUSE字段用于记录chunk1是否在使用，如果chunk1在使用，自然不需要和chunk1进行合并，
+//                也就不需要找了，如果chunk1空闲可合并，那么chunk2的prev_size字段会记录chunk1的size，此时可以直接前推出chunk1_addr。
+//       找chunk3: 堆top chunk保证至少MINSIZE的空闲，使得最后一个从top chunk分配出去的chunk可以正常访问下一个prev_size和PREV_INUSE
+//                flag。根据chunk2_size后推出chunk3_addr，如果chunk3是top chunk，chunk2直接和top合并，否则继续根据chunk3_size
+//                后推出下一个chunk（必然存在）访问其PREV_INUSE字段判断chunk3是否空闲可合并。
+//    4） 大块mmap（由动态MMAP_THRESHOLD阈值控制）的必要性：
+//　　　   top chunk达到阈值时，分配器会通过brk系统调用向系统释放虚拟内存和物理内存，但是如果一些空闲chunk由于碎片无法合并回top chunk，
+//        停留在空闲链表结构中的chunk，出于避免复用缺页原因，其物理内存不会被分配器自动madvice(MADV_DONTNEED)释放。大块分配的物理内存
+//        如果在空闲链表中滞留时间过长，会导致RSS在上层free后仍持续较高。而mmap chunk可以在free后直接munmap，不参与回收/复用管理。
+//    5） glibc 2.39 / x86-64
+//       +----------------------------------+
+//       | thread 1 / tcache                |
+//       | entries[64]: singly linked list  |
+//       | counts[64] : node count          |         +--------------------------------------+
+//       | thread_arena                     +----+    | arena mutex                          |
+//       +----------------------------------+    |    | fastbinsY[10]: singly linked list    |
+//                                               |    | bins[]: doubly linked list           |
+//       +----------------------------------+    +--->+   unsorted[1]: 1 bin / any size      |
+//       | thread 2 / tcache                |    |    |   small[2..63]: 62 bins / 32..1008B  |
+//       | entries[64]: singly linked list  |    |    |   large[64..126]: 63 bins / >=1024B  |
+//       | counts[64] : node count          |    |    | top -> [top chunk]                   |
+//       | thread_arena                     +----+    +--------------------------------------+
+//       +----------------------------------+
+//     -- tcache（单链表）：每个线程一个，存储该线程独有的较小的chunk，有限额，超过的需要回共享arena。标志其中chunk使用状态的
+//                        PREV_INUSE flag保持为1。
+//     -- fastbinsY（单链表）：存储极小的chunk，标志其中chunk使用状态的PREV_INUSE flag保持为1，意味着他们不参与合并，好处是
+//                           避免马上就复用时的合并/切分来回成本，代价是会导致其他chunk也无法合并加剧碎片问题。由于不参与合并
+//                           所以不需要双向链表用于取任意chunk。支持“插入-插入”和“插入-取出”头操作cas无锁并发，但是“取出-取出”
+//                           仍需要拿mutex串行。
+//     -- unsortedbin（双链表）：所有合并/切分后的（large）chunk都需要直接插到该bin的尾部中转，因为后续如果马上又要合并/切分的话，
+//                             又会取出来修改chunk size，之前插入有序large bin的开销就浪费了。代价是需要付出中转成本，如果碎片
+//                             较多导致合并操作无法有效执行，可能导致unsorted链变长，导致插入有序large bin的成本集中转移到了后续的
+//                             的复用分配中。
+
+// 每个线程
+// └── tcache
+//     ├── entries[]：各尺寸单链表的头
+//     └── counts[]：各链表的节点数量
+
+// 每个 arena：一个 malloc_state
+// ├── mutex
+// ├── fastbinsY[]：另一套按精确尺寸分桶的单链表
+// ├── bins[]：存放各普通 bin 的双向链表头
+// │   ├── unsorted bin
+// │   ├── small bins
+// │   └── large bins
+// └── top：当前顶部空闲块
+
+// 独立 mmap chunk
+// └── 通过自身头部记录释放信息，不进入上述空闲 bins
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
@@ -129,12 +195,8 @@ namespace ROCKSDB_NAMESPACE {
 // Arena是一个针对memtable场景的一个支持std::max_align_t默认对齐（不处理over-aligned）的内存分配器，他的特点是生命周期和
 // memtable绑定，而且memtable是一个对元素只add不delete的数据结构，Arena分配给memtable的所有内存只会随着memtable的销毁整体释放，
 // 也就意味着Arena不需要处理小块的回收和复用问题，因此：
-//   1） 分配小块只需要在active block下一个分配位置直接取align后的目标addr，不需要为零散free的小块维护多个固定size的free list便于复用。
-//   2） 返回给上层申请者的小块不需要在返回地址前维护所属小块在free list中的所属size、list ptr、各种管理标志位等信息。
-//   3） PS：glibc的malloc分配器支持std::max_align_t对齐，但是由于他不需要处理任意的对齐，所以不需要在每个小块header处预留
-//          ”align - 1 + raw_ptr size + raw size”的超额空间，假设std::max_align_t是16，他保证每个小块首地址和size都
-//          对齐到16，然后小块分配给上层时返回的是“首地址+16”的addr，然后小块header的16字节用于记录小块的raw size和一些flag bits。
-//          free时通过“上层ptr-16”就找到了块头。相当于通过固定的16对齐避免了额外的“align - 1 + raw_ptr_size”的超额空间。
+//   1） 分配小块只需要在active block下一个分配位置直接取align后的目标addr，不需要为零散free的小块维护复杂的回收/复用结构。
+//   2） 返回给上层申请者的小块块头没有固定8字节的记录chunk size的开销。
 class Arena : public Allocator {
  public:
   // No copying allowed
