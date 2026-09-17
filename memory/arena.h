@@ -134,7 +134,7 @@ namespace ROCKSDB_NAMESPACE {
 //　　　   top chunk达到阈值时，分配器会通过brk系统调用向系统释放虚拟内存和物理内存，但是如果一些空闲chunk由于碎片无法合并回top chunk，
 //        停留在空闲链表结构中的chunk，出于避免复用缺页原因，其物理内存不会被分配器自动madvice(MADV_DONTNEED)释放。大块分配的物理内存
 //        如果在空闲链表中滞留时间过长，会导致RSS在上层free后仍持续较高。而mmap chunk可以在free后直接munmap，不参与回收/复用管理。
-//    5） glibc 2.39 / x86-64
+//    5） chunk回收/复用结构：
 //       +----------------------------------+
 //       | thread 1 / tcache                |
 //       | entries[64]: singly linked list  |
@@ -151,30 +151,37 @@ namespace ROCKSDB_NAMESPACE {
 //     -- tcache（单链表）：每个线程一个，存储该线程独有的较小的chunk，有限额，超过的需要回共享arena。标志其中chunk使用状态的
 //                        PREV_INUSE flag保持为1。
 //     -- fastbinsY（单链表）：存储极小的chunk，标志其中chunk使用状态的PREV_INUSE flag保持为1，意味着他们不参与合并，好处是
-//                           避免马上就复用时的合并/切分来回成本，代价是会导致其他chunk也无法合并加剧碎片问题。由于不参与合并
-//                           所以不需要双向链表用于取任意chunk。支持“插入-插入”和“插入-取出”头操作cas无锁并发，但是“取出-取出”
-//                           仍需要拿mutex串行。
-//     -- unsortedbin（双链表）：所有合并/切分后的（large）chunk都需要直接插到该bin的尾部中转，因为后续如果马上又要合并/切分的话，
+//                           避免马上就复用时的合并/切分来回成本，代价是会导致其他chunk也无法合并加剧碎片问题（削弱unsortedbin的作用）。
+//                           由于不参与合并所以不需要双向链表用于取任意chunk。支持“插入-插入”和“插入-取出”头操作cas无锁并发，但是
+//                           “取出-取出”仍需要拿mutex串行。
+//     -- unsortedbin（双链表）：所有合并/切分后的（large）chunk都需要直接插到该bin的链表中转，因为后续如果马上又要合并/切分的话，
 //                             又会取出来修改chunk size，之前插入有序large bin的开销就浪费了。代价是需要付出中转成本，如果碎片
 //                             较多导致合并操作无法有效执行，可能导致unsorted链变长，导致插入有序large bin的成本集中转移到了后续的
-//                             的复用分配中。
-
-// 每个线程
-// └── tcache
-//     ├── entries[]：各尺寸单链表的头
-//     └── counts[]：各链表的节点数量
-
-// 每个 arena：一个 malloc_state
-// ├── mutex
-// ├── fastbinsY[]：另一套按精确尺寸分桶的单链表
-// ├── bins[]：存放各普通 bin 的双向链表头
-// │   ├── unsorted bin
-// │   ├── small bins
-// │   └── large bins
-// └── top：当前顶部空闲块
-
-// 独立 mmap chunk
-// └── 通过自身头部记录释放信息，不进入上述空闲 bins
+//                             的复用分配中。（例如，A->B->C->D四个chunk进行free，如果他们能够有效合并成一个，那么他们free时的
+//                             开销就只有“合并+unsortedbin链操作”的O(1)开销，后续复用分配时最多只需要执行一次有序bin插入，但是
+//                             如果四个chunk被碎片隔开无法合并，他们就会单独存在于unsortedbin中，后续复用分配时仍需要执行4次有序
+//                             bin插入，而且还付出了中转到unsortedbin到成本。）
+//     -- smallbins（双链表）：小尺寸chunk的有序bin结构，每个桶一个尺寸，没有桶内搜索成本。
+//     -- largebins（双链表）：大尺寸chunk的有序bin结构，每个桶负责一个尺寸区间，所以桶内的搜索成本较高。
+//     -- top chunk：管理从堆brk申请后的剩余可分配空间。空闲链表中的chunk物理内存只有在合并回到top chunk后才有机会被分配器按照阈值
+//                   自动归还给操作系统。
+//    6）malloc/free流程：
+//       malloc：tchache->fastbin->（小申请先查精确smallbin/大申请先整理合并fastbin）->尺寸归类unsortedbin至上限或遇到精确匹配chunk
+//               ->到有序bins搜索能够容纳申请size的chunk->top chunk->（小申请会整理合并fastbin后重试）->sysmalloc（brk扩展堆/mmap）
+//       free：tcache->fastbin->PREV_INUSE置0后合并前后chunk->回top/插入unsortedbin->（top chunk超阈值触发systrim收缩堆）
+//    7）多arena原理：
+//       -- 每个线程tcache会关联一个arena，每个arena有自己的heap，其中main arena的heap就是系统堆，而non-main arena的heap是通过mmap
+//          创建的。由于上层在线程A malloc的内存可能在线程B free，所以不可以根据tcache记录到的arena进行free。
+//       -- non-main arena的heap首地址按照heap_size进行对齐（先mmap 2*heap_size占位，再将返回地址向上对齐到heap_size倍数，随后将前后
+//          不需要的munmap），所以free一个chunk的时候，先根据flag字段判断是否属于main arena，如果是non-main arena，将chunk_addr向下对
+//          齐到heap_size的倍数，得到的就是对应heap的首地址。再通过heap头部结构获取arena对象等信息。
+//       -- 当non-main arena的heap用完之后，可以mmap新建一个独立heap，多个heap通过头部结构链接起来，并且指向同一个arena对象。heap收缩
+//          通过覆盖PROT_NONE mmap同时释放物理页和禁止读写。
+//    8）总结：glibc malloc内存分配器的设计方式高度依赖空闲chunk的合并（最理想的情况是直接能够合并回top），否则回收的chunk无法服务更大的
+//            请求。unsortedbin是为了避免反复合并后进出有序bin导致的开销。而tcache/fastbin本质上会阻碍合并的发生（削弱unsortedbin的作
+//            用），但是却可以避免回收/复用时的合并/拆分/访问空闲链表开销。而整个合并/切分/bin操作都是耦合共享结构的，所以也难以做到细粒度并
+//            发操作，虽然能够通过多arena实现以arena为粒度的并发，但是一个线程只能从关联到他tcache的arena分配内存，其他arena如果有空闲块
+//            无法被利用。
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
