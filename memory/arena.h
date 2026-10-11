@@ -170,6 +170,9 @@ namespace ROCKSDB_NAMESPACE {
 //                           致后续真正的大请求反而无法复用大chunk了。
 //     -- top chunk：管理从堆brk申请后的剩余可分配空间。空闲链表中的chunk物理内存只有在合并回到top chunk后才有机会被分配器按照阈值
 //                   自动归还给操作系统。
+//     -- last remainder：当unsortedbin中只有一个chunk时，该chunk可以被标记为last_remainder，后续的small请求，如果在对应smallbin
+//                        中不存在exact-fix chunk时，会优先切分last_remainder，避免对unsortedbin chunk进行有序归类以及重新best-fit
+//                        选块等有序bin管理成本，还可以获得小对象紧凑分配带来的内存局部性优势。
 //    6）malloc/free流程：
 //       malloc：tchache->fastbin->（小申请先查精确smallbin/大申请先整理合并fastbin）->尺寸归类unsortedbin至上限或遇到精确匹配chunk
 //               ->到有序bins搜索能够容纳申请size的chunk->top chunk->（小申请会整理合并fastbin后重试）->sysmalloc（brk扩展堆/mmap）
@@ -185,8 +188,10 @@ namespace ROCKSDB_NAMESPACE {
 //    8）总结：glibc malloc内存分配器的设计方式高度依赖空闲chunk的合并（最理想的情况是直接能够合并回top），否则回收的chunk无法服务更大的
 //            请求。unsortedbin是为了避免反复合并后进出有序bin导致的开销。而tcache/fastbin本质上会阻碍合并的发生（削弱unsortedbin的作
 //            用），但是却可以避免回收/复用时的合并/拆分/访问空闲链表开销。而整个合并/切分/bin操作都是耦合共享结构的，所以也难以做到细粒度并
-//            发操作，虽然能够通过多arena实现以arena为粒度的并发，但是一个线程只能从关联到他tcache的arena分配内存，其他arena如果有空闲块
-//            无法被利用，反而会造成内存复用率低下导致RSS无效累积。
+//            发操作，虽然能够通过多arena实现以arena为粒度的并发，但是:
+//               -- RSS无效驻留：一个线程只能从关联到他tcache的arena分配内存，其他arena如果有空闲块也无法被利用，造成内存复用率低下。
+//               -- 物理内存间接复用成本：即使一个arena的空闲块合并回top使物理内存得到释放，其他arena复用物理内存也要重新缺页。
+//               -- 跨线程free并发竞争：当内存块的malloc和free不是同一个线程时，执行free的线程仍然需要回到malloc时的arena执行free。
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
