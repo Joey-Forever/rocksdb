@@ -192,6 +192,60 @@ namespace ROCKSDB_NAMESPACE {
 //               -- RSS无效驻留：一个线程只能从关联到他tcache的arena分配内存，其他arena如果有空闲块也无法被利用，造成内存复用率低下。
 //               -- 物理内存间接复用成本：即使一个arena的空闲块合并回top使物理内存得到释放，其他arena复用物理内存也要重新缺页。
 //               -- 跨线程free并发竞争：当内存块的malloc和free不是同一个线程时，执行free的线程仍然需要回到malloc时的arena执行free。
+//  11. jemalloc内存分配器原理：
+//   +--------------------------+  +--------------------------+                     +--------------------------+
+//   | thread 0 / tcache        |  | thread 1 / tcache        |         ...         | thread N / tcache        |
+//   | size-class pointer stacks|  | size-class pointer stacks|                     | size-class pointer stacks|
+//   +-------------+------------+  +-------------+------------+                     +-------------+------------+
+//                 |                             |                                                |
+//                 +--------------+--------------+                                                |
+//                                v                                                               v
+//   +------------------------------ arena 0 -------------------------------+       +--------------------------+
+//   |                                                                      |  ...  | arena N                  |
+//   | +------------- small-object bins (size class x shard) -------------+ |       | bins + PAC + metadata    |
+//   | | bin[0] ... bin[k] ... : each bin has its own mutex               | |       +--------------------------+
+//   | |   slabcur       -> current slab / region bitmap                  | |
+//   | |   slabs_nonfull -> pairing heap of slabs, ordered by (sn, addr)  | |
+//   | |   slabs_full    -> full-slab list (maintained for manual arenas) | |
+//   | +------------------------------------------------------------------+ |
+//   |                                                                      |
+//   | +------------------- PAC page allocator -------------------+         |       +-------------------------------+
+//   | | +-----------------------+      +-----------------------+ |         |       | global emap / radix tree      |
+//   | | | ecache_dirty          |      | ecache_retained       | |         |       | leaf: edata pointer + summary |
+//   | | | delayed coalescing    |      | immediate coalescing  | |         |       | shared by all arenas          |
+//   | | | dirty decay / LRU     |      | no ordinary decay     | |         |       +-------------------------------+
+//   | | +-----------------------+      +-----------------------+ |         |
+//   | |                           +------------------------------+         |
+//   | | +-----------------------+ |    +------------------------+          |
+//   | | | ecache_muzzy          | |    | edata_cache (per arena)|          |
+//   | | | immediate coalescing  | |    | unused descriptors     |          |
+//   | | | muzzy decay / LRU     | |    | mutex + available heap |          |
+//   | | +-----------------------+ |    +------------------------+          |
+//   | +---------------------------+                                        |
+//   +----------------------------------------------------------------------+
+//    -- slab bins：按size class分bin数组，每个bin负责一个档位，默认共36种档位，覆盖8B～16KB
+//    -- ecache_xxx：按extent size区间分bin数组，每个bin负责一个extent size range，内部维护per bin paring heap和LRU
+//    -- global emap：全局共享Radix Tree，通过4kb页号进行定位叶slot，所有arena的extent都注册在其中。
+//    -- edata_t：extent的外置描述符，包括extent的addr/size、所属arena/bin/shard、pairing heap node、LRU node等。
+//    -- slab内固定分配策略：16KB以下的小请求直接向上取整到对应档位的slab bin中去取，slab extent内划为若干个对应固定档位size的region，
+//                         分配时按照bitmap直接复用对应空闲region。因此不同档位小请求分配/释放可以直接在不同slab bin之间并行执行。
+//    -- extent优先复用策略：slab bins和ecache都是优先复用（sn，addr）更小的non-full/empty extent。这有利于另一个方向的extent及时排
+//                         空，从而减少slab bins中的半空slab extent，提高slab内存利用率。也有利于ecache_dirty/ecache_muzzy中淘汰的
+//                         empty extent往（sn，addr）大的方向集中，有利于进行empty extent的合并，合并则可以为后续大extent请求累积空间、
+//                         减少活跃edata_t供edata_cache复用、purge前先合并淘汰extent可以减少madvice系统调用次数。
+//    -- 空闲extent分级decay策略：ecache_dirty采用“延迟合并+no_purge”，可以避免回收/复用extent时的合并/切分开销以及避免复用时的缺页成本；
+//                              ecache_muzzy采用“立即合并+lazy_purge”，享受extent合并优势同时允许一定程度的RSS驻留；
+//                              ecache_retained采用“立即合并+force_purge”，最大程度发挥extent合并优势以及最大程度降低RSS驻留。
+//                            在tcache批量flush、涉及arena操作的对象分配/释放时会推进ticker并触发decay检查，ecache_dirty和
+//                            ecache_muzzy在达到各自decay条件时根据各自LRU进行淘汰+purge（ecache_dirty还会在purge前执行延迟合并），
+//                            随后进入下一级ecache。LRU只追踪extent进出对应eset先后，由于复用空闲extent时优先(sn,addr)小的，所以
+//                            另一方向的extent倾向往LRU头部集中进而更容易被淘汰到下一级。
+//    -- mmap后retain策略：当PAC中没有足够extent时，会mmap一块大虚拟内存后切分立即使用量和余量，余量直接放在ecache_extent中供后续切分复用，
+//                        每个新切分出来的extent会取得唯一的sn用于heap排序。
+//    -- 元数据外置策略：extent的edata_t外置，避免slab内分配region时需要额外对齐以及避免extent首个4KB page无法purge，更安全避免被越界写坏；
+//                    上层分配块无额外header，不依靠glibc那样的复杂chunk header设计，free时直接根据global emap索引获取对应edata_t信息，
+//                    包括size class、area归属等，避免逐对象header的重复空间开销，更灵活也更安全避免被越界写坏。
+//    
 
 // JOEY_TODO: 实现ART
 // 朴素Radix Tree（！！和基于key comapre的索引结构比，不需要单独存key了！！）：
